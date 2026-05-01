@@ -1,0 +1,10 @@
+# Binaries are downloaded by postinstall into bin/, never published.
+bin/cux
+bin/cux.exe
+bin/cux.exe.sha256
+bin/cux.sha256
+
+# Local dev junk
+node_modules/
+.DS_Store
+*.tgz

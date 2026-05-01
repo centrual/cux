@@ -1,0 +1,49 @@
+{
+  "name": "@inulute/cux",
+  "version": "0.2.0",
+  "description": "Multi-account switcher for Claude Code with hook-driven auto-resume",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "cli",
+    "account",
+    "switcher",
+    "oauth"
+  ],
+  "homepage": "https://github.com/inulute/claude-switch",
+  "bugs": {
+    "url": "https://github.com/inulute/claude-switch/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inulute/claude-switch.git"
+  },
+  "license": "MIT",
+  "author": "inulute",
+  "type": "module",
+  "bin": {
+    "cux": "bin/cux.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

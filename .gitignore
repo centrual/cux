@@ -1,0 +1,25 @@
+# compiled binary
+cux
+cux-*
+*.exe
+*.sha256
+
+# editor
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# rendered logo previews — only the SVG sources are kept in the repo
+assets/*.png
+assets/*-preview.*
+
+# npm wrapper local artefacts
+npm/bin/cux
+npm/bin/cux.exe
+npm/bin/*.sha256
+npm/node_modules/
+PLAN.md
+PROGRESS.md

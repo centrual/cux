@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, suffix: "" }
+          - { goos: linux,   goarch: arm64, suffix: "" }
+          - { goos: darwin,  goarch: amd64, suffix: "" }
+          - { goos: darwin,  goarch: arm64, suffix: "" }
+          - { goos: windows, goarch: amd64, suffix: ".exe" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          out="cux-${GOOS}-${GOARCH}${{ matrix.suffix }}"
+          go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cux
+          sha256sum "$out" > "$out.sha256"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cux-*
+            cux-*.sha256
+          generate_release_notes: true

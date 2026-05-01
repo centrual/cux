@@ -1,0 +1,295 @@
+// Package store owns cux's state file (state.json) and the per-account
+// oauthAccount-block backups. Credential blobs live in the creds package;
+// nothing token-shaped touches store.
+package store
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/inulute/cux/internal/atomicfile"
+	"github.com/inulute/cux/internal/paths"
+)
+
+const stateVersion = 1
+
+// Account is one managed Claude Code account.
+type Account struct {
+	Slot     int       `json:"slot"`
+	Email    string    `json:"email"`
+	UUID     string    `json:"uuid"`
+	AddedAt  time.Time `json:"addedAt"`
+	LastUsed time.Time `json:"lastUsed,omitempty"`
+}
+
+// State is the on-disk shape of state.json.
+type State struct {
+	Version     int             `json:"version"`
+	ActiveSlot  int             `json:"activeSlot"`
+	LastUpdated time.Time       `json:"lastUpdated"`
+	Sequence    []int           `json:"sequence"` // user-visible ordering for `cux switch` rotation
+	Accounts    map[int]Account `json:"accounts"`
+}
+
+var (
+	ErrAccountExists  = errors.New("store: account already managed")
+	ErrAccountMissing = errors.New("store: account not found")
+	ErrEmptyState     = errors.New("store: no managed accounts")
+)
+
+var emailRE = regexp.MustCompile(`^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$`)
+
+func ValidateEmail(s string) error {
+	if !emailRE.MatchString(s) {
+		return fmt.Errorf("store: invalid email %q", s)
+	}
+	return nil
+}
+
+// Load reads state.json. If the file does not exist, returns a fresh
+// empty State — callers can save it back to materialise a new install.
+func Load() (*State, error) {
+	path := paths.StateFile()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &State{
+				Version:  stateVersion,
+				Accounts: map[int]Account{},
+				Sequence: []int{},
+			}, nil
+		}
+		return nil, fmt.Errorf("store: read %s: %w", path, err)
+	}
+
+	// We accept either a typed map[int]Account or — for compatibility
+	// with hand-written or migrated state — keys-as-strings. Decode via
+	// an intermediate where account keys are strings, then convert.
+	var raw struct {
+		Version     int                `json:"version"`
+		ActiveSlot  int                `json:"activeSlot"`
+		LastUpdated time.Time          `json:"lastUpdated"`
+		Sequence    []int              `json:"sequence"`
+		Accounts    map[string]Account `json:"accounts"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("store: parse %s: %w", path, err)
+	}
+
+	s := &State{
+		Version:     raw.Version,
+		ActiveSlot:  raw.ActiveSlot,
+		LastUpdated: raw.LastUpdated,
+		Sequence:    raw.Sequence,
+		Accounts:    make(map[int]Account, len(raw.Accounts)),
+	}
+	if s.Sequence == nil {
+		s.Sequence = []int{}
+	}
+	for k, v := range raw.Accounts {
+		n, err := strconv.Atoi(k)
+		if err != nil {
+			return nil, fmt.Errorf("store: bad account key %q in state.json", k)
+		}
+		s.Accounts[n] = v
+	}
+	return s, nil
+}
+
+// Save writes state.json atomically. Callers are expected to hold the
+// state lock from the lockfile package across read-modify-write cycles.
+func (s *State) Save() error {
+	if err := os.MkdirAll(paths.BackupRoot(), 0o700); err != nil {
+		return fmt.Errorf("store: mkdir %s: %w", paths.BackupRoot(), err)
+	}
+
+	s.Version = stateVersion
+	s.LastUpdated = time.Now().UTC()
+
+	// Re-encode accounts with string keys for stable JSON output.
+	accounts := make(map[string]Account, len(s.Accounts))
+	for k, v := range s.Accounts {
+		accounts[strconv.Itoa(k)] = v
+	}
+	out := struct {
+		Version     int                `json:"version"`
+		ActiveSlot  int                `json:"activeSlot"`
+		LastUpdated time.Time          `json:"lastUpdated"`
+		Sequence    []int              `json:"sequence"`
+		Accounts    map[string]Account `json:"accounts"`
+	}{s.Version, s.ActiveSlot, s.LastUpdated, s.Sequence, accounts}
+
+	data, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return fmt.Errorf("store: marshal: %w", err)
+	}
+	return atomicfile.Write(paths.StateFile(), data, 0o600)
+}
+
+// FindByEmail returns the slot for a given email, or 0 if none.
+func (s *State) FindByEmail(email string) int {
+	for slot, a := range s.Accounts {
+		if a.Email == email {
+			return slot
+		}
+	}
+	return 0
+}
+
+// Resolve accepts either a slot number ("2") or an email and returns
+// the matching account. Returns ErrAccountMissing if neither matches.
+func (s *State) Resolve(identifier string) (Account, error) {
+	if n, err := strconv.Atoi(identifier); err == nil {
+		if a, ok := s.Accounts[n]; ok {
+			return a, nil
+		}
+		return Account{}, fmt.Errorf("%w: slot %d", ErrAccountMissing, n)
+	}
+	if err := ValidateEmail(identifier); err != nil {
+		return Account{}, err
+	}
+	if slot := s.FindByEmail(identifier); slot != 0 {
+		return s.Accounts[slot], nil
+	}
+	return Account{}, fmt.Errorf("%w: %s", ErrAccountMissing, identifier)
+}
+
+// NextSlot returns the lowest unused positive slot number. Reusing
+// holes keeps slot numbers from growing unboundedly across many
+// add/remove cycles.
+func (s *State) NextSlot() int {
+	used := make(map[int]bool, len(s.Accounts))
+	for k := range s.Accounts {
+		used[k] = true
+	}
+	for n := 1; ; n++ {
+		if !used[n] {
+			return n
+		}
+	}
+}
+
+// Add registers a new account in state. The caller is responsible for
+// having already saved its credentials and oauthAccount block via
+// creds.WriteBackup and store.WriteOAuthBlockBackup.
+func (s *State) Add(slot int, email, uuid string) error {
+	if err := ValidateEmail(email); err != nil {
+		return err
+	}
+	if _, exists := s.Accounts[slot]; exists {
+		return fmt.Errorf("%w: slot %d already in use", ErrAccountExists, slot)
+	}
+	if existing := s.FindByEmail(email); existing != 0 {
+		return fmt.Errorf("%w: %s is already slot %d", ErrAccountExists, email, existing)
+	}
+	s.Accounts[slot] = Account{
+		Slot:    slot,
+		Email:   email,
+		UUID:    uuid,
+		AddedAt: time.Now().UTC(),
+	}
+	s.Sequence = append(s.Sequence, slot)
+	return nil
+}
+
+// Remove unregisters an account. Caller must separately delete the
+// account's credential and oauth backups.
+func (s *State) Remove(slot int) error {
+	if _, ok := s.Accounts[slot]; !ok {
+		return fmt.Errorf("%w: slot %d", ErrAccountMissing, slot)
+	}
+	delete(s.Accounts, slot)
+	out := s.Sequence[:0]
+	for _, n := range s.Sequence {
+		if n != slot {
+			out = append(out, n)
+		}
+	}
+	s.Sequence = out
+	if s.ActiveSlot == slot {
+		s.ActiveSlot = 0
+	}
+	return nil
+}
+
+// NextInRotation returns the slot that follows current in Sequence,
+// wrapping at the end. Returns 0 if there are fewer than two accounts.
+func (s *State) NextInRotation(current int) int {
+	if len(s.Sequence) < 2 {
+		return 0
+	}
+	idx := -1
+	for i, n := range s.Sequence {
+		if n == current {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return s.Sequence[0]
+	}
+	return s.Sequence[(idx+1)%len(s.Sequence)]
+}
+
+// SortedSlots returns slots in Sequence order — the order users see when
+// listing or rotating. New entries are appended to the end on Add.
+func (s *State) SortedSlots() []int {
+	if len(s.Sequence) == len(s.Accounts) {
+		out := make([]int, len(s.Sequence))
+		copy(out, s.Sequence)
+		return out
+	}
+	// Sequence has drifted from Accounts (e.g. hand-edited state). Fall
+	// back to numeric order so we still return every account.
+	out := make([]int, 0, len(s.Accounts))
+	for k := range s.Accounts {
+		out = append(out, k)
+	}
+	sort.Ints(out)
+	return out
+}
+
+// --- per-account oauthAccount block backup --------------------------------
+
+// WriteOAuthBlockBackup saves the oauthAccount JSON for an account.
+func WriteOAuthBlockBackup(slot int, email string, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return errors.New("store: refusing to back up empty oauthAccount block")
+	}
+	dir := paths.AccountDir(slot, email)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("store: mkdir %s: %w", dir, err)
+	}
+	return atomicfile.Write(filepath.Join(dir, "oauth.json"), raw, 0o600)
+}
+
+// ReadOAuthBlockBackup loads the oauthAccount JSON for an account.
+func ReadOAuthBlockBackup(slot int, email string) (json.RawMessage, error) {
+	b, err := os.ReadFile(filepath.Join(paths.AccountDir(slot, email), "oauth.json"))
+	if err != nil {
+		return nil, fmt.Errorf("store: read oauth backup: %w", err)
+	}
+	// Validate it's still parseable JSON before handing it back; we'd
+	// rather fail here than write garbage to ~/.claude/.claude.json.
+	var probe interface{}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return nil, fmt.Errorf("store: oauth backup not valid JSON: %w", err)
+	}
+	return json.RawMessage(b), nil
+}
+
+// DeleteOAuthBlockBackup removes the per-account directory.
+func DeleteOAuthBlockBackup(slot int, email string) error {
+	dir := paths.AccountDir(slot, email)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("store: remove %s: %w", dir, err)
+	}
+	return nil
+}
