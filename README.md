@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/cux-banner.png" alt="cux — Run multiple Claude Code Pro/Max accounts as one" width="100%">
+  <img src="./assets/cux-banner.webp" alt="cux — Run multiple Claude Code Pro/Max accounts as one" width="100%">
 </p>
 
 <p align="center">
