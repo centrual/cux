@@ -33,10 +33,26 @@ jobs:
           out="cux-${GOOS}-${GOARCH}${{ matrix.suffix }}"
           go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cux
           sha256sum "$out" > "$out.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cux-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            cux-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+            cux-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}.sha256
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            cux-*
-            cux-*.sha256
+          files: dist/*
           generate_release_notes: true
