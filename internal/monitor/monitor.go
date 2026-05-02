@@ -17,17 +17,29 @@ package monitor
 import (
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/inulute/cux/internal/claudecfg"
 	"github.com/inulute/cux/internal/creds"
+	"github.com/inulute/cux/internal/lockfile"
+	"github.com/inulute/cux/internal/paths"
 	"github.com/inulute/cux/internal/store"
 	"github.com/inulute/cux/internal/usage"
 )
+
+const lockTimeout = 10 * time.Second
 
 // RefreshAll fetches usage for every managed account and writes the
 // merged cache to disk. Returns the resulting cache plus any per-account
 // errors so the caller can surface them without aborting the whole
 // refresh — one expired token shouldn't poison the others.
 func RefreshAll() (usage.Cache, []error) {
+	lk, err := lockfile.Acquire(paths.LockFile(), lockTimeout)
+	if err != nil {
+		return nil, []error{fmt.Errorf("monitor: acquire lock: %w", err)}
+	}
+	defer lk.Unlock() //nolint:errcheck
+
 	state, err := store.Load()
 	if err != nil {
 		return nil, []error{err}
@@ -63,6 +75,12 @@ func RefreshActive(email string) error {
 	if email == "" {
 		return errors.New("monitor: empty email")
 	}
+	lk, err := lockfile.Acquire(paths.LockFile(), lockTimeout)
+	if err != nil {
+		return fmt.Errorf("monitor: acquire lock: %w", err)
+	}
+	defer lk.Unlock() //nolint:errcheck
+
 	state, err := store.Load()
 	if err != nil {
 		return err
@@ -84,21 +102,72 @@ func RefreshActive(email string) error {
 	return usage.SaveCache(cache)
 }
 
-// refreshOne reads the account's stored credentials, extracts the
-// bearer token, and queries the usage API. Errors at any stage are
-// returned; the caller decides whether to keep going.
+// refreshOne reads the account's stored credentials, refreshes the
+// access token if it is expired or near expiry, and queries the usage API.
+//
+// Token refresh priority:
+//  1. If IsTokenExpired: call RefreshBlob (standard OAuth refresh_token flow)
+//     and update the backup so the next call is already fresh.
+//  2. If the API still returns 401 (e.g. the refresh token itself expired):
+//     fall back to the live credentials file, but only when the live account
+//     email matches, to avoid using a different account's token.
 func refreshOne(slot int, email string) (usage.AccountUsage, error) {
 	blob, err := creds.ReadBackup(slot, email)
 	if err != nil {
 		return usage.AccountUsage{}, err
 	}
+
+	// Proactively refresh before we even try the API if the token is
+	// expired or within the 5-minute buffer window.
+	if creds.IsTokenExpired(blob) {
+		if freshBlob, refreshErr := creds.RefreshBlob(blob); refreshErr == nil {
+			if writeErr := creds.WriteBackup(slot, email, freshBlob); writeErr != nil {
+				// If we can't persist the new token, the refresh token may
+				// be single-use (OAuth 2.1) and we'd permanently lose access.
+				// Treat this as fatal rather than silently proceeding with a
+				// token we cannot save.
+				return usage.AccountUsage{}, fmt.Errorf("monitor: save refreshed token: %w", writeErr)
+			}
+			blob = freshBlob
+		}
+		// If RefreshBlob failed, continue with the existing blob — the API
+		// call may still work, and if not we fall back to live below.
+	}
+
 	token, err := creds.ExtractAccessToken(blob)
 	if err != nil {
 		return usage.AccountUsage{}, err
 	}
 	u, err := usage.Fetch(token)
-	if err != nil {
+	if err == nil {
+		return u, nil
+	}
+	if !u.TokenExpired {
 		return u, err
 	}
-	return u, nil
+
+	// Still getting 401. The refresh token itself may be expired, or the
+	// account was re-logged-in via `claude login` without a `cux add`.
+	// Try the live credentials as a last resort, but only for the account
+	// that is currently active (to avoid cross-account token use).
+	liveBlob, liveErr := creds.ReadLive()
+	if liveErr != nil {
+		return u, err
+	}
+	_, parsed, cfgErr := claudecfg.ReadOAuthBlock()
+	if cfgErr != nil || parsed.EmailAddress != email {
+		return u, err
+	}
+	liveToken, tokErr := creds.ExtractAccessToken(liveBlob)
+	if tokErr != nil {
+		return u, err
+	}
+	u2, err2 := usage.Fetch(liveToken)
+	if err2 != nil {
+		return u, err
+	}
+	// Live token worked — update the backup so the next refresh uses it.
+	// Best-effort: if this fails we still return the valid usage data.
+	_ = creds.WriteBackup(slot, email, liveBlob)
+	return u2, nil
 }

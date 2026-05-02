@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build *)",
+      "Bash(go run *)",
+      "Bash(CUX_CONFIG_FILE=/tmp/cux-test-config.json go run *)",
+      "Bash(install -m 0755 /tmp/cux-new /home/osx/.local/bin/cux)",
+      "Bash(rm /tmp/cux-new)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); o=d.get\\('claudeAiOauth',{}\\); print\\(list\\(o.keys\\(\\)\\)\\)\")",
+      "Read(//home/osx/.local/share/claude/versions/**)",
+      "Read(//home/osx/.local/share/claude/**)",
+      "Bash(grep -oE '[a-zA-Z0-9_-]{20,}')",
+      "Bash(python3 *)",
+      "Skill(codex:adversarial-review)",
+      "Bash(go vet *)",
+      "Bash(go test *)",
+      "Bash(cux version *)",
+      "Bash(./cux version *)",
+      "Bash(/tmp/cux-test version *)",
+      "Bash(/tmp/cux-test --help)",
+      "Bash(/tmp/cux-test status *)",
+      "Bash(/tmp/cux-test list *)",
+      "Bash(/tmp/cux-test config *)",
+      "Bash(node -e \"const p=require\\('./npm/package.json'\\); console.log\\(p.version\\)\")",
+      "Bash(echo \"npm version: $\\(node -e \"const p=require\\('./npm/package.json'\\); console.log\\(p.version\\)\"\\)\")",
+      "Bash(/tmp/cux-test setup *)"
+    ]
+  }
+}

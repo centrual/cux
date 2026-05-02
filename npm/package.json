@@ -1,7 +1,7 @@
 {
   "name": "@inulute/cux",
-  "version": "0.2.0",
-  "description": "Multi-account switcher for Claude Code with hook-driven auto-resume",
+  "version": "0.2.1",
+  "description": "Run multiple Claude Code accounts as one",
   "keywords": [
     "claude",
     "claude-code",

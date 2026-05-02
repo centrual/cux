@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	version = "0.2.0"
+	version = "0.2.1"
 	// donateURL is shown only by `cux version --verbose`. Subtle by
 	// design — never printed during normal use, never injected into
 	// help output, never shown by the wrapper or the slash command.
@@ -178,36 +178,14 @@ func cmdList(args []string) {
 	}
 	liveEmail, _ := switcher.CurrentLiveEmail()
 
-	slots := state.SortedSlots()
-	sort.Ints(slots)
-	fmt.Println("Slot  Email                                  5h     7d     Resets         Status")
-	for _, slot := range slots {
-		a := state.Accounts[slot]
-		marker := ""
-		if a.Email == liveEmail {
-			marker = "active"
-		}
-		u := cache[a.Email]
-		five := windowPct(u.FiveHour)
-		seven := windowPct(u.SevenDay)
-		resets := nextReset(u)
-		expired := ""
-		if u.TokenExpired {
-			expired = "expired"
-			if marker != "" {
-				expired = "active+expired"
-			}
-		}
-		statusLabel := marker
-		if expired != "" {
-			statusLabel = expired
-		}
-		fmt.Printf("%-5d %-38s %-6s %-6s %-14s %s\n", slot, a.Email, five, seven, resets, statusLabel)
-	}
+	cfg, _ := config.Load()
+	setTheme(cfg.Theme)
+
+	printFancyHeader(os.Stdout, state, liveEmail)
+	printAccountTable(os.Stdout, state, liveEmail, cache)
 
 	if !*refresh && len(cache) == 0 {
-		fmt.Println()
-		fmt.Println("(No usage data yet — run `cux list --refresh` or `cux usage refresh` to fetch.)")
+		fmt.Printf("\n %s(No usage data — run `cux list --refresh` or `cux usage refresh` to fetch.)%s\n\n", colorGray, colorReset)
 	}
 }
 
@@ -264,21 +242,31 @@ func cmdRemove(args []string) {
 }
 
 func cmdStatus(args []string) {
+	cfg, _ := config.Load()
+	setTheme(cfg.Theme)
+
 	state, err := store.Load()
 	if err != nil {
 		fail(err)
 	}
 	liveEmail, liveErr := switcher.CurrentLiveEmail()
 	if liveErr != nil {
-		fmt.Println("Live login: (none — run `claude login`)")
-	} else {
-		fmt.Println("Live login:", liveEmail)
+		liveEmail = ""
 	}
-	fmt.Println("Managed accounts:", len(state.Accounts))
-	if state.ActiveSlot != 0 {
-		if a, ok := state.Accounts[state.ActiveSlot]; ok {
-			fmt.Printf("Active slot:     %d (%s)\n", a.Slot, a.Email)
+
+	cache, _ := usage.LoadCache()
+	if cache == nil {
+		cache = usage.Cache{}
+	}
+
+	printFancyHeader(os.Stdout, state, liveEmail)
+	if len(state.Accounts) > 0 {
+		printAccountTable(os.Stdout, state, liveEmail, cache)
+		if len(cache) == 0 {
+			fmt.Printf("\n %s(No usage data — run `cux usage refresh` to fetch.)%s\n\n", colorGray, colorReset)
 		}
+	} else {
+		fmt.Printf(" %sNo accounts managed yet. Run `cux add` while logged in.%s\n\n", colorGray, colorReset)
 	}
 }
 
@@ -540,6 +528,7 @@ func editConfigInteractive() error {
 		if err != nil {
 			return err
 		}
+		setTheme(c.Theme)
 		printConfigEditor(c)
 		fmt.Print("Select setting, Esc/q=exit: ")
 		choice, err := readEditorChoice(raw, reader)
@@ -642,6 +631,14 @@ func editConfigInteractive() error {
 			if err := setAndSaveConfig("notify", strconv.FormatBool(!c.Notify)); err != nil {
 				return err
 			}
+		case "12":
+			next := "default"
+			if c.Theme == "default" {
+				next = "claude"
+			}
+			if err := setAndSaveConfig("theme", next); err != nil {
+				return err
+			}
 		default:
 			fmt.Print("Unknown selection.\r\n")
 			waitEnter(reader)
@@ -692,6 +689,7 @@ func printConfigEditor(c config.Config) {
 	row(9, "update check", checkbox(c.UpdateCheck.Enabled), "toggle", true)
 	row(10, "update cadence", strconv.Itoa(c.UpdateCheck.CadenceHours)+"h", "edit hours", false)
 	row(11, "notifications", checkbox(c.Notify), "toggle", true)
+	row(12, "theme", c.Theme, "cycle default/claude", false)
 
 	fmt.Printf("%s└────┴────────────────────────────┴────────────────────────────┴────────────────────────────────────┘%s\r\n\r\n", g, r)
 }
@@ -708,14 +706,52 @@ func setAndSaveConfig(key, value string) error {
 	return config.Save(c)
 }
 
-// ANSI colors
-const (
+// ANSI colors (themed)
+var (
 	colorReset  = "\033[0m"
 	colorBold   = "\033[1m"
 	colorTeal   = "\033[36m"
 	colorGray   = "\033[90m"
 	colorYellow = "\033[33m"
+	colorGreen  = "\033[32m"
 )
+
+// UI layout geometry: visual character widths for the status/list view.
+// The box border width (boxBorder) equals the sum of all column widths
+// plus the inner dividers, so the status header box and the account table
+// share exactly the same outer visual width (104 chars).
+const (
+	colSlotW  = 6   // SLOT column cell width
+	colEmailW = 30  // ACCOUNT column cell width
+	colStateW = 8   // STATE column cell width
+	colBarW   = 22  // usage bar column cell width (1 + 15 blocks + " %3d%%" + 1)
+	colResetW = 8   // RESET column cell width
+	barBlocks = 15  // number of █/░ segments in a usage bar
+	boxBorder = 101 // ─ count in the status box (= table inner width)
+	boxInner  = 99  // content chars between the status box margin spaces
+)
+
+func setTheme(name string) {
+	// Standard ANSI defaults
+	colorReset = "\033[0m"
+	colorBold = "\033[1m"
+	colorTeal = "\033[36m"
+	colorGray = "\033[90m"
+	colorYellow = "\033[33m"
+	colorGreen = "\033[32m"
+
+	if name == "claude" {
+		// Claude Brand Colors (Truecolor RGB)
+		// Primary Orange: #C15F3C
+		// Accent Orange: #FFB38A
+		// Cloudy Neutral: #B1ADA1
+		colorBold = "\033[1;38;2;193;95;60m"   // Bold Claude Orange
+		colorTeal = "\033[38;2;255;179;138m"   // Light Orange Accent
+		colorGray = "\033[38;2;177;173;161m"   // Cloudy Neutral
+		colorYellow = "\033[38;2;255;179;138m" // Use accent for prompts too
+		colorGreen = "\033[38;2;193;95;60m"    // Use primary for success/enabled
+	}
+}
 
 func promptValue(raw *rawMenu, reader *bufio.Reader, label, current string) (string, bool, error) {
 	fmt.Printf("%s%s%s\r\n", colorBold, label, colorReset)
@@ -862,9 +898,9 @@ func waitEnter(reader *bufio.Reader) {
 
 func checkbox(v bool) string {
 	if v {
-		return "[\033[32mx\033[0m] enabled "
+		return "[" + colorGreen + "x" + colorReset + "] enabled "
 	}
-	return "[\033[90m \033[0m] disabled"
+	return "[" + colorGray + " " + colorReset + "] disabled"
 }
 
 func displayEmpty(s string) string {
@@ -997,11 +1033,119 @@ func cmdSetup(args []string) {
 	if err := offerUpdateCheckOptIn(); err != nil {
 		fail(err)
 	}
+	if err := offerConfigSetup(); err != nil {
+		fail(err)
+	}
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  1. Run `cux add` or `/cux:add` while logged in to each account you want to manage.")
 	fmt.Println("  2. Restart Claude Code (or start a new session) so it picks up the hooks.")
 	fmt.Println("  3. Launch sessions with `cux` instead of `claude`, then use /switch and /cux:* inside.")
+}
+
+// offerConfigSetup shows the current config summary and offers to open
+// the interactive editor so users can tune settings during first-run setup.
+func offerConfigSetup() error {
+	if !stdinIsTTY() {
+		return nil
+	}
+	c, err := config.Load()
+	if err != nil {
+		return err
+	}
+	setTheme(c.Theme)
+	fmt.Println()
+	printSetupConfigSummary(c)
+	fmt.Print("Customize these settings now? [y/N] ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer == "y" || answer == "yes" {
+		return editConfigInteractive()
+	}
+	return nil
+}
+
+// printSetupConfigSummary renders a compact table of the most important
+// settings so the user knows what's active without opening the full editor.
+func printSetupConfigSummary(c config.Config) {
+	g, r, t, b := colorGray, colorReset, colorTeal, colorBold
+
+	width := 54 // inner content width between the border spaces
+
+	hline := func(l, m, mid, rr string) {
+		fmt.Printf(" %s%s%s%s%s%s%s\n", g, l, strings.Repeat(m, 18), mid, strings.Repeat(m, width-18), rr, r)
+	}
+
+	row := func(label, value string) {
+		lpad := 18 - len(label) - 1
+		if lpad < 0 {
+			lpad = 0
+		}
+		vpad := width - 18 - len([]rune(stripANSI(value))) - 1
+		if vpad < 0 {
+			vpad = 0
+		}
+		fmt.Printf(" %s│%s %s%-*s%s %s│%s %s%s%s%s %s│%s\n",
+			g, r,
+			t, lpad, label, r,
+			g, r,
+			b, value, r,
+			strings.Repeat(" ", vpad),
+			g, r,
+		)
+	}
+
+	boolVal := func(v bool, onLabel, offLabel string) string {
+		if v {
+			return colorGreen + "✓ " + onLabel + colorReset
+		}
+		return colorGray + "✗ " + offLabel + colorReset
+	}
+
+	fmt.Printf(" %s%s:: C O N F I G   P R E V I E W ::%s\n\n", g, b, r)
+	hline("┌", "─", "┬", "┐")
+	fmt.Printf(" %s│%s %-16s %s│%s %-*s %s│%s\n",
+		g, r,
+		b+"SETTING"+r,
+		g, r,
+		width-18, b+"VALUE"+r,
+		g, r,
+	)
+	hline("├", "─", "┼", "┤")
+	row("theme", c.Theme)
+	row("strategy", c.Strategy.Kind)
+	row("5h threshold", strconv.Itoa(c.Thresholds.FiveHour)+"%")
+	row("7d threshold", strconv.Itoa(c.Thresholds.SevenDay)+"%")
+	row("threshold switch", boolVal(c.AutoSwitchOnThreshold, "on", "off"))
+	row("rate-limit switch", boolVal(c.AutoSwitchOnRateLimit, "on", "off"))
+	row("auto resume", boolVal(c.AutoResume, "on", "off"))
+	row("resume message", clip(displayEmpty(c.AutoMessage), width-20))
+	row("update checks", boolVal(c.UpdateCheck.Enabled, "on", "off"))
+	hline("└", "─", "┴", "┘")
+	fmt.Println()
+}
+
+// stripANSI removes ANSI escape sequences so we can measure visual width.
+func stripANSI(s string) string {
+	var out []byte
+	inEsc := false
+	for i := 0; i < len(s); i++ {
+		if inEsc {
+			if (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		if s[i] == '\x1b' {
+			inEsc = true
+			continue
+		}
+		out = append(out, s[i])
+	}
+	return string(out)
 }
 
 func offerUpdateCheckOptIn() error {
@@ -1134,6 +1278,202 @@ func sameDir(a, b string) bool {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "cux:", err)
 	os.Exit(1)
+}
+
+// padTo right-pads s to exactly n rune-columns, truncating with "…" if needed.
+func padTo(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) > n {
+		if n <= 1 {
+			return string(runes[:n])
+		}
+		return string(runes[:n-1]) + "…"
+	}
+	return s + strings.Repeat(" ", n-len(runes))
+}
+
+// renderColorBar returns a colorized usage bar of barW block-chars followed by
+// a right-aligned percentage. Visual width: barW+5 (e.g. barW=15 → 20 chars).
+func renderColorBar(pct float64, barW int) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := int(pct / 100.0 * float64(barW))
+	return colorGreen + strings.Repeat("█", filled) +
+		colorGray + strings.Repeat("░", barW-filled) + colorReset +
+		colorTeal + fmt.Sprintf(" %3.0f%%", pct) + colorReset
+}
+
+// accountState returns the display label for one row in the account table.
+func accountState(email, liveEmail string, au usage.AccountUsage) string {
+	if au.TokenExpired {
+		return "EXPRD"
+	}
+	if email == liveEmail {
+		return "ACTIVE"
+	}
+	if au.FiveHour != nil && au.FiveHour.Utilization >= 100 {
+		return "FULL"
+	}
+	if au.FiveHour != nil {
+		return "READY"
+	}
+	return "IDLE"
+}
+
+// tableSep builds one horizontal separator line for the account table.
+// left/mid/right are the box-drawing corner/junction characters.
+func tableSep(left, mid, right string) string {
+	g, r := colorGray, colorReset
+	cols := []int{colSlotW, colEmailW, colStateW, colBarW, colBarW, colResetW}
+	var sb strings.Builder
+	sb.WriteString(" " + g + left)
+	for i, w := range cols {
+		sb.WriteString(strings.Repeat("─", w))
+		if i < len(cols)-1 {
+			sb.WriteString(mid)
+		}
+	}
+	sb.WriteString(right + r)
+	return sb.String()
+}
+
+// printFancyHeader prints the ASCII art banner and the system status box.
+func printFancyHeader(w io.Writer, st *store.State, liveEmail string) {
+	g, r, t, b := colorGray, colorReset, colorTeal, colorBold
+
+	fmt.Fprintf(w, "\n%s%s%s\n", t, branding.Banner, r)
+	fmt.Fprintf(w, " %s:: A C C O U N T   P O O L ::%s\n\n", b, r)
+
+	statusLabel := "NONE"
+	slotStr := "--"
+	if liveEmail != "" {
+		statusLabel = "ACTIVE"
+		if st.ActiveSlot != 0 {
+			slotStr = fmt.Sprintf("%02d", st.ActiveSlot)
+		}
+	}
+	managedStr := fmt.Sprintf("%02d", len(st.Accounts))
+
+	liveDisp := liveEmail
+	if liveDisp == "" {
+		liveDisp = "(none — run `claude login`)"
+	}
+
+	// Compute visible widths for correct padding (all fields are ASCII except
+	// liveDisp, which may contain an em-dash in the fallback string).
+	l1Left := len("  SYSTEM STATUS : ") + len(statusLabel) + len(" [") + len(slotStr) + len("]")
+	l1Right := len("MANAGED ACCOUNTS : ") + len(managedStr) + len("  ")
+	l1Pad := boxInner - l1Left - l1Right
+	if l1Pad < 1 {
+		l1Pad = 1
+	}
+
+	l2Prefix := "  LIVE INSTANCE : "
+	liveRunes := []rune(liveDisp)
+	l2Pad := boxInner - len(l2Prefix) - len(liveRunes)
+	if l2Pad < 0 {
+		max := boxInner - len(l2Prefix) - 1
+		if max > 0 {
+			liveDisp = string(liveRunes[:max]) + "…"
+		}
+		l2Pad = 0
+	}
+
+	statusColor := t
+	if statusLabel == "ACTIVE" {
+		statusColor = colorGreen
+	}
+
+	line1 := g + "  SYSTEM STATUS : " + r +
+		statusColor + statusLabel + r +
+		g + " [" + slotStr + "]" + r +
+		strings.Repeat(" ", l1Pad) +
+		g + "MANAGED ACCOUNTS : " + r +
+		b + managedStr + r + "  "
+
+	line2 := g + l2Prefix + r +
+		t + liveDisp + r +
+		strings.Repeat(" ", l2Pad)
+
+	fmt.Fprintf(w, " %s┌%s┐%s\n", g, strings.Repeat("─", boxBorder), r)
+	fmt.Fprintf(w, " %s│%s %s %s│%s\n", g, r, line1, g, r)
+	fmt.Fprintf(w, " %s│%s %s %s│%s\n", g, r, line2, g, r)
+	fmt.Fprintf(w, " %s└%s┘%s\n\n", g, strings.Repeat("─", boxBorder), r)
+}
+
+// printAccountTable renders the full account usage table below the status box.
+func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usage.Cache) {
+	g, r, t, b := colorGray, colorReset, colorTeal, colorBold
+
+	hCell := func(text string, cellW int) string {
+		return " " + b + padTo(text, cellW-2) + r + " "
+	}
+
+	fmt.Fprintln(w, tableSep("┌", "┬", "┐"))
+	fmt.Fprintf(w, " %s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s\n",
+		g, r, hCell("SLOT", colSlotW),
+		g, r, hCell("ACCOUNT", colEmailW),
+		g, r, hCell("STATE", colStateW),
+		g, r, hCell("5H USAGE", colBarW),
+		g, r, hCell("7D USAGE", colBarW),
+		g, r, hCell("RESET", colResetW),
+		g, r)
+	fmt.Fprintln(w, tableSep("├", "┼", "┤"))
+
+	slots := st.SortedSlots()
+	sort.Ints(slots)
+
+	noBar := strings.Repeat(" ", 10) + g + "─" + r + strings.Repeat(" ", 11)
+
+	for _, slot := range slots {
+		a := st.Accounts[slot]
+		au := cache[a.Email]
+		sl := accountState(a.Email, liveEmail, au)
+
+		var sc string
+		switch sl {
+		case "ACTIVE":
+			sc = colorGreen
+		case "FULL", "EXPRD":
+			sc = colorYellow
+		default:
+			sc = t
+		}
+
+		resetStr := nextReset(au)
+
+		var barFive, barSeven string
+		if au.FiveHour != nil {
+			barFive = " " + renderColorBar(au.FiveHour.Utilization, barBlocks) + " "
+		} else {
+			barFive = noBar
+		}
+		if au.SevenDay != nil {
+			barSeven = " " + renderColorBar(au.SevenDay.Utilization, barBlocks) + " "
+		} else {
+			barSeven = noBar
+		}
+
+		slotCell := "  " + b + fmt.Sprintf("%02d", slot) + r + "  "
+		emailCell := " " + t + padTo(a.Email, colEmailW-2) + r + " "
+		stateCell := " " + sc + padTo(sl, colStateW-2) + r + " "
+		resetCell := " " + t + padTo(resetStr, colResetW-2) + r + " "
+
+		fmt.Fprintf(w, " %s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s%s%s│%s\n",
+			g, r, slotCell,
+			g, r, emailCell,
+			g, r, stateCell,
+			g, r, barFive,
+			g, r, barSeven,
+			g, r, resetCell,
+			g, r)
+	}
+
+	fmt.Fprintln(w, tableSep("└", "┴", "┘"))
 }
 
 func printHelp() {

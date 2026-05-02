@@ -18,16 +18,24 @@
 // `ExtractAccessToken`, a tiny convenience that pulls the OAuth bearer
 // out of a blob so the wrapper can call the usage API without
 // re-implementing the parse in two places.
+//
+// RefreshBlob and IsTokenExpired provide a first-class token-refresh
+// path so cux never needs Claude Code to be running in order to obtain
+// a fresh access token.
 package creds
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/zalando/go-keyring"
 
@@ -44,6 +52,16 @@ const macKeychainService = "Claude Code-credentials"
 // macOS/Windows. Distinct from claude-swap's "claude-code" so a user who
 // has both tools installed sees no overlap.
 const backupKeyringService = "cux-backup"
+
+// OAuth token-refresh constants extracted from the Claude Code binary.
+// The endpoint and client_id are fixed for Claude Code's public OAuth app.
+const (
+	claudeTokenEndpoint = "https://platform.claude.com/v1/oauth/token"
+	claudeClientID      = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	// refreshBuffer is how far before expiry we proactively refresh.
+	// 5 minutes gives a safety margin without being over-eager.
+	refreshBuffer = 5 * time.Minute
+)
 
 // ErrNotFound is returned by ReadLive when no live credentials exist
 // (user never logged in, or just logged out).
@@ -113,6 +131,118 @@ func ExtractAccessToken(blob string) (string, error) {
 		return "", ErrNotFound
 	}
 	return doc.ClaudeAIOAuth.AccessToken, nil
+}
+
+// IsTokenExpired reports whether the access token in blob has already
+// expired or will expire within the refresh buffer window. Returns false
+// when the expiry field is absent or unparseable (fail-open so callers
+// still attempt the API call and handle a real 401 themselves).
+func IsTokenExpired(blob string) bool {
+	var doc struct {
+		ClaudeAIOAuth struct {
+			ExpiresAt int64 `json:"expiresAt"` // milliseconds since Unix epoch
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal([]byte(blob), &doc); err != nil || doc.ClaudeAIOAuth.ExpiresAt == 0 {
+		return false
+	}
+	return time.Until(time.UnixMilli(doc.ClaudeAIOAuth.ExpiresAt)) < refreshBuffer
+}
+
+// RefreshBlob exchanges the refresh token inside blob for a new access
+// token, updates the blob in-place, and returns the updated copy.
+// The original blob is returned alongside any error so callers can fall
+// back gracefully.
+func RefreshBlob(blob string) (string, error) {
+	// Parse the entire blob as a raw map so unknown top-level keys survive.
+	var rawDoc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(blob), &rawDoc); err != nil {
+		return blob, fmt.Errorf("creds: parse blob: %w", err)
+	}
+
+	// Parse the claudeAiOauth sub-object as a raw map to preserve all fields
+	// (subscriptionType, rateLimitTier, scopes, etc.).
+	rawOAuth, ok := rawDoc["claudeAiOauth"]
+	if !ok {
+		return blob, fmt.Errorf("creds: no claudeAiOauth block in blob")
+	}
+	var oauthMap map[string]json.RawMessage
+	if err := json.Unmarshal(rawOAuth, &oauthMap); err != nil {
+		return blob, fmt.Errorf("creds: parse claudeAiOauth: %w", err)
+	}
+
+	// Extract the refresh token.
+	var refreshToken string
+	rt, hasRT := oauthMap["refreshToken"]
+	if !hasRT {
+		return blob, fmt.Errorf("creds: no refreshToken in blob")
+	}
+	if err := json.Unmarshal(rt, &refreshToken); err != nil || refreshToken == "" {
+		return blob, fmt.Errorf("creds: empty or unparseable refreshToken")
+	}
+
+	// Call the token endpoint.
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {claudeClientID},
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.PostForm(claudeTokenEndpoint, form)
+	if err != nil {
+		return blob, fmt.Errorf("creds: token refresh request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return blob, fmt.Errorf("creds: read refresh response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		snip := string(body)
+		if len(snip) > 200 {
+			snip = snip[:200]
+		}
+		return blob, fmt.Errorf("creds: token refresh HTTP %d: %s", resp.StatusCode, snip)
+	}
+
+	// Parse the response.
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"` // seconds
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return blob, fmt.Errorf("creds: parse token response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return blob, fmt.Errorf("creds: token response missing access_token")
+	}
+
+	// Patch the oauth map with the new values.
+	newAT, _ := json.Marshal(tokenResp.AccessToken)
+	oauthMap["accessToken"] = newAT
+
+	if tokenResp.RefreshToken != "" {
+		newRT, _ := json.Marshal(tokenResp.RefreshToken)
+		oauthMap["refreshToken"] = newRT
+	}
+	if tokenResp.ExpiresIn > 0 {
+		expiresAt := time.Now().UnixMilli() + tokenResp.ExpiresIn*1000
+		newExp, _ := json.Marshal(expiresAt)
+		oauthMap["expiresAt"] = newExp
+	}
+
+	// Rebuild the blob.
+	newOAuth, err := json.Marshal(oauthMap)
+	if err != nil {
+		return blob, fmt.Errorf("creds: marshal updated oauth block: %w", err)
+	}
+	rawDoc["claudeAiOauth"] = newOAuth
+	newBlob, err := json.Marshal(rawDoc)
+	if err != nil {
+		return blob, fmt.Errorf("creds: marshal updated blob: %w", err)
+	}
+	return string(newBlob), nil
 }
 
 // DeleteBackup removes the saved credential blob for one account.

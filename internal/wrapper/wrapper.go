@@ -93,9 +93,15 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 	// to "no decision" rather than guessing.
 	go func() { _, _ = monitor.RefreshAll() }()
 
+	// lastManualTarget holds the email the user explicitly switched to
+	// within this wrapper session. Threshold auto-switch is suppressed
+	// while the live account matches this value, so a manual choice is
+	// not silently undone by usage-based rotation.
+	var lastManualTarget string
+
 	currentArgv := argv
 	for {
-		exitCode, sessionID, p, err := launch(claudeBin, currentArgv, pid, &cfg, w)
+		exitCode, sessionID, hadTurns, p, err := launch(claudeBin, currentArgv, pid, &cfg, lastManualTarget, w)
 		if err != nil {
 			return exitCode, err
 		}
@@ -145,6 +151,16 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			_ = monitor.RefreshActive(to)
 		}(from.Email, to.Email)
 
+		// Update the manual-switch guard. A deliberate /switch sets the
+		// guard; a rate-limit or threshold swap clears it (necessity wins).
+		if p.trigger == history.TriggerManual {
+			lastManualTarget = to.Email
+			setManualSwitchState(to.Email)
+		} else {
+			lastManualTarget = ""
+			setManualSwitchState("")
+		}
+
 		switch p.trigger {
 		case history.TriggerRateLimit:
 			fmt.Fprintf(w, "cux: rate limit on %s → swapped to %s, resuming…\n", from.Email, to.Email)
@@ -154,7 +170,9 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			fmt.Fprintf(w, "cux: %s → %s (%s), resuming…\n", from.Email, to.Email, p.reason)
 		}
 
-		if sessionID != "" && cfg.AutoResume {
+		if sessionID != "" && cfg.AutoResume && hadTurns {
+			// Only resume if at least one turn completed — an empty/just-started
+			// session has no transcript content, and claude rejects --resume for it.
 			currentArgv = []string{"--resume", sessionID}
 			if p.resumeMessage != "" {
 				currentArgv = append(currentArgv, p.resumeMessage)
@@ -191,10 +209,28 @@ func cleanupWrapperPID(pid int) {
 	}
 }
 
+// setManualSwitchState persists the manual-switch target into state.json
+// so that other running wrapper instances can also respect the user's choice.
+// email="" clears the guard (called after rate-limit or threshold switches).
+func setManualSwitchState(email string) {
+	st, err := store.Load()
+	if err != nil {
+		return
+	}
+	st.ManualSwitchEmail = email
+	if email != "" {
+		st.ManualSwitchAt = time.Now().UTC()
+	} else {
+		st.ManualSwitchAt = time.Time{}
+	}
+	_ = st.Save()
+}
+
 // launch runs claude once, polling for signals until the child exits.
 // Returns the child's exit code, the session_id we observed (if any),
-// and a non-nil pending struct if the wrapper has decided to swap.
-func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config, w io.Writer) (int, string, *pending, error) {
+// whether at least one turn completed (Stop signal fired), and a non-nil
+// pending struct if the wrapper has decided to swap.
+func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config, manualTarget string, w io.Writer) (int, string, bool, *pending, error) {
 	cmd := exec.Command(claudeBin, argv...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -204,7 +240,7 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 		envWrapperPID+"="+strconv.Itoa(wrapperPID),
 	)
 	if err := cmd.Start(); err != nil {
-		return 1, "", nil, fmt.Errorf("wrapper: start claude: %w", err)
+		return 1, "", false, nil, fmt.Errorf("wrapper: start claude: %w", err)
 	}
 
 	var (
@@ -213,6 +249,7 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 		swap      *pending
 	)
 	var stopRequested atomic.Bool
+	var hadTurns atomic.Bool // true once the first Stop signal fires
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -227,7 +264,7 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				step(wrapperPID, cfg, &mu, &sessionID, &swap, &stopRequested, cmd, w)
+				step(wrapperPID, cfg, manualTarget, &mu, &sessionID, &swap, &stopRequested, &hadTurns, cmd, w)
 			}
 		}
 	}()
@@ -242,7 +279,7 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 		if errors.As(waitErr, &ee) {
 			exitCode = ee.ExitCode()
 		} else {
-			return 1, sessionID, nil, waitErr
+			return 1, sessionID, hadTurns.Load(), nil, waitErr
 		}
 	}
 
@@ -262,7 +299,7 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 			finalSessionID = bestEffortSessionID(cwd)
 		}
 	}
-	return exitCode, finalSessionID, finalSwap, nil
+	return exitCode, finalSessionID, hadTurns.Load(), finalSwap, nil
 }
 
 // step is one tick of the poll loop. It consumes any signals present
@@ -270,10 +307,12 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 func step(
 	wrapperPID int,
 	cfg *config.Config,
+	manualTarget string,
 	mu *sync.Mutex,
 	sessionID *string,
 	swap **pending,
 	stopRequested *atomic.Bool,
+	hadTurns *atomic.Bool,
 	cmd *exec.Cmd,
 	w io.Writer,
 ) {
@@ -355,12 +394,13 @@ func step(
 	// threshold check would read stale data left from a prior Stop.
 	if _, ok, _ := signals.Read(wrapperPID, signals.Stopped); ok {
 		_ = signals.Consume(wrapperPID, signals.Stopped)
+		hadTurns.Store(true)
 		if email, err := switcher.CurrentLiveEmail(); err == nil {
 			_ = monitor.RefreshActive(email)
 		}
 		mu.Lock()
 		if *swap == nil && cfg.AutoSwitchOnThreshold {
-			if p := evaluateThresholdSwap(cfg); p != nil {
+			if p := evaluateThresholdSwap(cfg, manualTarget); p != nil {
 				*swap = p
 			}
 		}
@@ -393,10 +433,27 @@ func snapshotActiveUsage() usage.AccountUsage {
 // cached usage has crossed the configured thresholds. Returns nil
 // when no swap is warranted, when the cache has no entry yet, or
 // when no other account has spare capacity per strategy.
-func evaluateThresholdSwap(cfg *config.Config) *pending {
+//
+// manualTarget suppresses auto-switch when the live account was
+// deliberately placed there by a /switch command (in this wrapper or
+// any other — checked via state.ManualSwitchEmail). Necessity (rate
+// limit) overrides this guard and clears it.
+func evaluateThresholdSwap(cfg *config.Config, manualTarget string) *pending {
 	email, err := switcher.CurrentLiveEmail()
 	if err != nil {
 		return nil
+	}
+
+	// Layer 1: in-wrapper guard.
+	if manualTarget != "" && email == manualTarget {
+		return nil
+	}
+	// Layer 2: cross-wrapper guard — another session manually placed
+	// this account here; respect their choice.
+	if st, err := store.Load(); err == nil {
+		if st.ManualSwitchEmail == email && !st.ManualSwitchAt.IsZero() {
+			return nil
+		}
 	}
 	cache, err := usage.LoadCache()
 	if err != nil || cache == nil {

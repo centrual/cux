@@ -13,7 +13,6 @@
 Thumbs.db
 
 # rendered logo previews — only the SVG sources are kept in the repo
-assets/*.png
 assets/*-preview.*
 
 # npm wrapper local artefacts

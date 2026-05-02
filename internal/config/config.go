@@ -68,6 +68,7 @@ type Config struct {
 	Notify                bool              `json:"notify"`
 	PollIntervalSeconds   int               `json:"poll_interval_seconds"`
 	UpdateCheck           UpdateCheckConfig `json:"update_check"`
+	Theme                 string            `json:"theme"`
 }
 
 // ResolvedStrategy returns the parsed strategy.Kind.
@@ -89,6 +90,7 @@ func Defaults() Config {
 		Notify:                true,
 		PollIntervalSeconds:   60,
 		UpdateCheck:           UpdateCheckConfig{Enabled: false, CadenceHours: 24},
+		Theme:                 "claude",
 	}
 }
 
@@ -226,6 +228,14 @@ func Set(c Config, key, value string) (Config, error) {
 			return c, fmt.Errorf("config: poll_interval_seconds must be a non-negative integer, got %q", value)
 		}
 		c.PollIntervalSeconds = n
+	case "theme":
+		v := strings.ToLower(strings.TrimSpace(value))
+		switch v {
+		case "default", "claude":
+			c.Theme = v
+		default:
+			return c, fmt.Errorf("config: theme must be default|claude, got %q", value)
+		}
 	default:
 		return c, fmt.Errorf("config: unknown key %q", key)
 	}
@@ -307,6 +317,11 @@ func Keys(c Config) []KeyInfo {
 			Key: "update_check.cadence_hours", Default: "24",
 			Description: "minimum hours between update checks (cached locally)",
 			Current:     strconv.Itoa(c.UpdateCheck.CadenceHours),
+		},
+		{
+			Key: "theme", Default: "default",
+			Description: "visual style: default | claude",
+			Current:     c.Theme,
 		},
 	}
 }

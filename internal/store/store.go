@@ -31,11 +31,13 @@ type Account struct {
 
 // State is the on-disk shape of state.json.
 type State struct {
-	Version     int             `json:"version"`
-	ActiveSlot  int             `json:"activeSlot"`
-	LastUpdated time.Time       `json:"lastUpdated"`
-	Sequence    []int           `json:"sequence"` // user-visible ordering for `cux switch` rotation
-	Accounts    map[int]Account `json:"accounts"`
+	Version          int             `json:"version"`
+	ActiveSlot       int             `json:"activeSlot"`
+	LastUpdated      time.Time       `json:"lastUpdated"`
+	Sequence         []int           `json:"sequence"` // user-visible ordering for `cux switch` rotation
+	Accounts         map[int]Account `json:"accounts"`
+	ManualSwitchEmail string         `json:"manualSwitchEmail,omitempty"`
+	ManualSwitchAt    time.Time      `json:"manualSwitchAt,omitempty"`
 }
 
 var (
@@ -73,22 +75,26 @@ func Load() (*State, error) {
 	// with hand-written or migrated state — keys-as-strings. Decode via
 	// an intermediate where account keys are strings, then convert.
 	var raw struct {
-		Version     int                `json:"version"`
-		ActiveSlot  int                `json:"activeSlot"`
-		LastUpdated time.Time          `json:"lastUpdated"`
-		Sequence    []int              `json:"sequence"`
-		Accounts    map[string]Account `json:"accounts"`
+		Version           int                `json:"version"`
+		ActiveSlot        int                `json:"activeSlot"`
+		LastUpdated       time.Time          `json:"lastUpdated"`
+		Sequence          []int              `json:"sequence"`
+		Accounts          map[string]Account `json:"accounts"`
+		ManualSwitchEmail string             `json:"manualSwitchEmail,omitempty"`
+		ManualSwitchAt    time.Time          `json:"manualSwitchAt,omitempty"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil, fmt.Errorf("store: parse %s: %w", path, err)
 	}
 
 	s := &State{
-		Version:     raw.Version,
-		ActiveSlot:  raw.ActiveSlot,
-		LastUpdated: raw.LastUpdated,
-		Sequence:    raw.Sequence,
-		Accounts:    make(map[int]Account, len(raw.Accounts)),
+		Version:           raw.Version,
+		ActiveSlot:        raw.ActiveSlot,
+		LastUpdated:       raw.LastUpdated,
+		Sequence:          raw.Sequence,
+		Accounts:          make(map[int]Account, len(raw.Accounts)),
+		ManualSwitchEmail: raw.ManualSwitchEmail,
+		ManualSwitchAt:    raw.ManualSwitchAt,
 	}
 	if s.Sequence == nil {
 		s.Sequence = []int{}
@@ -119,12 +125,14 @@ func (s *State) Save() error {
 		accounts[strconv.Itoa(k)] = v
 	}
 	out := struct {
-		Version     int                `json:"version"`
-		ActiveSlot  int                `json:"activeSlot"`
-		LastUpdated time.Time          `json:"lastUpdated"`
-		Sequence    []int              `json:"sequence"`
-		Accounts    map[string]Account `json:"accounts"`
-	}{s.Version, s.ActiveSlot, s.LastUpdated, s.Sequence, accounts}
+		Version           int                `json:"version"`
+		ActiveSlot        int                `json:"activeSlot"`
+		LastUpdated       time.Time          `json:"lastUpdated"`
+		Sequence          []int              `json:"sequence"`
+		Accounts          map[string]Account `json:"accounts"`
+		ManualSwitchEmail string             `json:"manualSwitchEmail,omitempty"`
+		ManualSwitchAt    time.Time          `json:"manualSwitchAt,omitempty"`
+	}{s.Version, s.ActiveSlot, s.LastUpdated, s.Sequence, accounts, s.ManualSwitchEmail, s.ManualSwitchAt}
 
 	data, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
