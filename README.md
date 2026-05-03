@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Run multiple Claude Code Pro/Max accounts as one.
+  Claude Code account switcher for uninterrupted sessions.
 </p>
 
 <p align="center">
@@ -30,7 +30,7 @@
 
 ---
 
-**`cux`** is a CLI for Claude Code that pools multiple Pro/Max
+**`cux`** is a CLI tool for Claude Code that pools multiple Pro/Max
 accounts behind a single live session. When the active account hits
 a rate limit, `cux` switches to a healthy account and continues the
 same conversation. For proactive threshold swaps, it waits for the
