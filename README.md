@@ -26,6 +26,11 @@
     <img alt="support"
          src="https://img.shields.io/badge/Support-%E2%99%A5-c8763a?style=for-the-badge&labelColor=0e1116&logo=githubsponsors&logoColor=f0ead6">
   </a>
+  &nbsp;
+  <a href="https://cux.inulute.com/docs">
+    <img alt="docs"
+         src="https://img.shields.io/badge/Docs-cux.inulute.com-c8763a?style=for-the-badge&labelColor=0e1116&logo=readthedocs&logoColor=f0ead6">
+  </a>
 </p>
 
 ---
