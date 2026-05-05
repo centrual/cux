@@ -537,9 +537,9 @@ func gracefulExit(cmd *exec.Cmd, w io.Writer) {
 //  1. The explicit target (/switch typed an email or slot).
 //  2. strategy.PickNext under the configured kind/order — for
 //     manual/rate-limit/threshold triggers without an explicit target.
-//  3. Bare rotation (NextInRotation) as a last-resort fallback when
-//     strategy returns no candidate, e.g. on a fresh install with no
-//     usage data and Manual mode.
+//  3. Capacity-aware rotation as a last-resort fallback when strategy
+//     returns no candidate, e.g. Manual mode or sparse fresh-install
+//     usage data.
 func resolveTarget(explicit string, trigger history.Trigger, cfg *config.Config) (string, error) {
 	if explicit != "" {
 		return explicit, nil
@@ -567,32 +567,59 @@ func resolveTarget(explicit string, trigger history.Trigger, cfg *config.Config)
 	// through to bare rotation in that case.
 	kind := cfg.ResolvedStrategy()
 	if trigger == history.TriggerManual && kind == strategy.KindManual {
-		return rotateFallback(state)
+		return rotateFallback(state, cache, cfg)
 	}
 	if pick, ok := strategy.PickNext(kind, cfg.Strategy.Order, candidates,
 		strategy.Candidate{Email: current}, cache, cfg.Thresholds); ok {
 		return pick.Email, nil
 	}
-	return rotateFallback(state)
+	return rotateFallback(state, cache, cfg)
 }
 
-// rotateFallback picks "any other account" using store's existing
-// rotation helper. Used when strategy declines (manual mode) or when
-// usage data is absent.
-func rotateFallback(state *store.State) (string, error) {
-	next := state.NextInRotation(state.ActiveSlot)
-	if next == 0 {
-		for slot := range state.Accounts {
-			if slot != state.ActiveSlot {
-				next = slot
-				break
+// rotateFallback walks store's rotation order, but still refuses accounts
+// that are known to have no capacity. Missing usage is treated as usable so
+// fresh installs can rotate before the first refresh completes.
+func rotateFallback(state *store.State, cache usage.Cache, cfg *config.Config) (string, error) {
+	for _, slot := range rotationSlots(state) {
+		acct, ok := state.Accounts[slot]
+		if !ok || slot == state.ActiveSlot {
+			continue
+		}
+		if accountHasSwitchCapacity(cache, acct.Email, cfg) {
+			return strconv.Itoa(slot), nil
+		}
+	}
+	return "", errors.New("no usable accounts available; all managed accounts are exhausted or need login")
+}
+
+func rotationSlots(state *store.State) []int {
+	slots := state.SortedSlots()
+	if next := state.NextInRotation(state.ActiveSlot); next != 0 {
+		for i, slot := range slots {
+			if slot == next {
+				return append(slots[i:], slots[:i]...)
 			}
 		}
 	}
-	if next == 0 {
-		return "", errors.New("could not determine a rotation target")
+	return slots
+}
+
+func accountHasSwitchCapacity(cache usage.Cache, email string, cfg *config.Config) bool {
+	u, ok := cache[email]
+	if !ok {
+		return true
 	}
-	return strconv.Itoa(next), nil
+	if u.TokenExpired {
+		return false
+	}
+	if u.SevenDay != nil && u.SevenDay.Utilization >= 100 {
+		return false
+	}
+	cap5 := cfg.Thresholds.FiveHour
+	if cap5 == 0 || cap5 == 100 {
+		cap5 = 90
+	}
+	return u.FiveHour == nil || u.FiveHour.Utilization < float64(cap5)
 }
 
 // bestEffortSessionID is the v0.1 fallback for capturing session id —

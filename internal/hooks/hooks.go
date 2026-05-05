@@ -249,6 +249,12 @@ func handleCuxPromptCommand(prompt string, stdout io.Writer) (bool, error) {
 }
 
 func writePromptSwitch(target string, stdout io.Writer) {
+	if strings.TrimSpace(target) == "" {
+		if ok, text := promptSwitchHasTarget(); !ok {
+			writePromptBlock(stdout, text)
+			return
+		}
+	}
 	pid, err := wrapperPID()
 	if err != nil {
 		writePromptBlock(stdout, "cux: "+err.Error())
@@ -266,6 +272,41 @@ func writePromptSwitch(target string, stdout io.Writer) {
 		reason = "cux: switching accounts to " + strings.TrimSpace(target) + "..."
 	}
 	writePromptBlock(stdout, reason)
+}
+
+func promptSwitchHasTarget() (bool, string) {
+	cfg, err := config.Load()
+	if err != nil {
+		return true, ""
+	}
+	state, err := store.Load()
+	if err != nil || len(state.Accounts) < 2 {
+		return true, ""
+	}
+	cache, _ := usage.LoadCache()
+	if cache == nil {
+		cache = usage.Cache{}
+	}
+	current, _ := switcher.CurrentLiveEmail()
+	candidates := make([]strategy.Candidate, 0, len(state.Accounts))
+	for _, a := range state.Accounts {
+		candidates = append(candidates, strategy.Candidate{Email: a.Email})
+	}
+	if _, ok := strategy.PickNext(cfg.ResolvedStrategy(), cfg.Strategy.Order, candidates,
+		strategy.Candidate{Email: current}, cache, cfg.Thresholds); ok {
+		return true, ""
+	}
+	for _, slot := range state.SortedSlots() {
+		acct := state.Accounts[slot]
+		if slot != state.ActiveSlot && accountHasPromptCapacity(cache, acct.Email, cfg.Thresholds) {
+			return true, ""
+		}
+	}
+	text, err := renderPromptUsage(false)
+	if err != nil {
+		return false, "cux: no usable accounts available; all managed accounts are exhausted or need login"
+	}
+	return false, text
 }
 
 func renderPromptUsage(refresh bool) (string, error) {
@@ -289,6 +330,7 @@ func renderPromptUsage(refresh bool) (string, error) {
 	if cache == nil {
 		cache = usage.Cache{}
 	}
+	cfg, _ := config.Load()
 	liveEmail, _ := switcher.CurrentLiveEmail()
 	activeSlot := 0
 	activeEmail := "(unknown)"
@@ -319,7 +361,7 @@ func renderPromptUsage(refresh bool) (string, error) {
 	b.WriteString("│ SLOT │ ACCOUNT                   │ STATE  │ 5H USAGE             │ 7D USAGE             │ RESET  │\n")
 	b.WriteString("├──────┼───────────────────────────┼────────┼──────────────────────┼──────────────────────┼────────┤\n")
 
-	allFiveHourFull := true
+	anyUsable := false
 	slots := state.SortedSlots()
 	sort.Ints(slots)
 	for i, slot := range slots {
@@ -336,11 +378,11 @@ func renderPromptUsage(refresh bool) (string, error) {
 				stateLabel += "+expired"
 			}
 		}
-		if !windowFull(u.FiveHour) {
-			allFiveHourFull = false
+		if accountHasPromptCapacity(cache, acct.Email, cfg.Thresholds) {
+			anyUsable = true
 		}
 		if stateLabel == "" {
-			stateLabel = capacityLabel(u)
+			stateLabel = capacityLabel(u, cfg.Thresholds)
 		}
 		b.WriteString(renderAccountRow(slot, acct.Email, u, stateLabel))
 		if i != len(slots)-1 {
@@ -348,13 +390,13 @@ func renderPromptUsage(refresh bool) (string, error) {
 		}
 	}
 	b.WriteString("└──────┴───────────────────────────┴────────┴──────────────────────┴──────────────────────┴────────┘")
-	if allFiveHourFull {
-		b.WriteString("\n\nSTATUS : NO 5H CAPACITY AVAILABLE")
+	if !anyUsable {
+		b.WriteString("\n\nSTATUS : ALL MANAGED ACCOUNTS EXHAUSTED")
 		if slot, email, reset, ok := nextResetSlot(state, cache); ok {
 			b.WriteString(fmt.Sprintf("\nNEXT RESET : SLOT [%02d] %s  IN %s", slot, email, reset))
 		}
 		b.WriteString("\nACTION : WAIT FOR RESET OR ADD ANOTHER ACCOUNT")
-	} else if slot, email, reset, ok := nextUsableSlot(state, cache); ok {
+	} else if slot, email, reset, ok := nextUsableSlot(state, cache, cfg.Thresholds); ok {
 		b.WriteString(fmt.Sprintf("\n\nNEXT USABLE : SLOT [%02d] %s", slot, email))
 		if reset != "" {
 			b.WriteString("  RESET " + reset)
@@ -524,28 +566,50 @@ func resetForAccount(u usage.AccountUsage) string {
 	return resetForWindow(u.FiveHour)
 }
 
-func capacityLabel(u usage.AccountUsage) string {
+func capacityLabel(u usage.AccountUsage, thresholds usage.Thresholds) string {
 	if u.TokenExpired {
 		return "expired"
 	}
-	if windowFull(u.FiveHour) || windowFull(u.SevenDay) {
+	if !usageHasPromptCapacity(u, thresholds) {
 		return "full"
 	}
 	return "usable"
 }
 
-func nextUsableSlot(state *store.State, cache usage.Cache) (slot int, email, reset string, ok bool) {
+func nextUsableSlot(state *store.State, cache usage.Cache, thresholds usage.Thresholds) (slot int, email, reset string, ok bool) {
 	slots := state.SortedSlots()
 	sort.Ints(slots)
 	for _, s := range slots {
 		acct := state.Accounts[s]
-		u := cache[acct.Email]
-		if u.TokenExpired || windowFull(u.FiveHour) || windowFull(u.SevenDay) {
+		if !accountHasPromptCapacity(cache, acct.Email, thresholds) {
 			continue
 		}
+		u := cache[acct.Email]
 		return s, acct.Email, resetForWindow(u.FiveHour), true
 	}
 	return 0, "", "", false
+}
+
+func accountHasPromptCapacity(cache usage.Cache, email string, thresholds usage.Thresholds) bool {
+	u, ok := cache[email]
+	if !ok {
+		return true
+	}
+	return usageHasPromptCapacity(u, thresholds)
+}
+
+func usageHasPromptCapacity(u usage.AccountUsage, thresholds usage.Thresholds) bool {
+	if u.TokenExpired {
+		return false
+	}
+	if u.SevenDay != nil && u.SevenDay.Utilization >= 100 {
+		return false
+	}
+	cap5 := thresholds.FiveHour
+	if cap5 == 0 || cap5 == 100 {
+		cap5 = 90
+	}
+	return u.FiveHour == nil || u.FiveHour.Utilization < float64(cap5)
 }
 
 func nextResetSlot(state *store.State, cache usage.Cache) (slot int, email, reset string, ok bool) {

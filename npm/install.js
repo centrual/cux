@@ -10,7 +10,7 @@
 // detects a missing binary at runtime and prints a clear error.
 
 import { createWriteStream, existsSync, mkdirSync, chmodSync, createReadStream, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { pipeline } from "node:stream/promises";
@@ -18,6 +18,8 @@ import { pipeline } from "node:stream/promises";
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, "package.json"), "utf8"));
 const version = pkg.version;
+const docsURL = "https://cux.inulute.com/docs";
+const supportURL = "https://support.inulute.com";
 
 // Banner. Mirrors internal/branding/branding.go and scripts/install.sh.
 // Suppressed by:
@@ -106,6 +108,63 @@ async function sha256(path) {
   return hash.digest("hex");
 }
 
+function pathEnvValue() {
+  return process.env.PATH || process.env.Path || process.env.path || "";
+}
+
+function pathContainsDir(dir) {
+  if (!dir) return false;
+  const want = normalizePathDir(dir);
+  return pathEnvValue()
+    .split(delimiter)
+    .filter(Boolean)
+    .some((entry) => normalizePathDir(entry) === want);
+}
+
+function normalizePathDir(dir) {
+  let out = dir;
+  if (process.platform === "win32") {
+    out = out.replace(/%([^%]+)%/g, (_, name) => process.env[name] || `%${name}%`);
+  }
+  out = resolve(out).replace(/[\\/]+$/, "");
+  if (process.platform === "win32") {
+    out = out.toLowerCase();
+  }
+  return out;
+}
+
+function npmGlobalBinHint() {
+  if (process.platform !== "win32") return;
+  if (process.env.npm_config_global !== "true") return;
+
+  const prefix = process.env.npm_config_prefix;
+  if (!prefix || pathContainsDir(prefix)) return;
+
+  console.error("");
+  console.error("cux: Windows PATH note");
+  console.error("  npm installed cux, but npm's global command folder is not on Path:");
+  console.error(`    ${prefix}`);
+  console.error("");
+  console.error("  Temporary fix for this terminal:");
+  console.error("    set PATH=%PATH%;%APPDATA%\\npm");
+  console.error("");
+  console.error("  Permanent fix:");
+  console.error("    Add the folder above to User Path, then open a new terminal.");
+  console.error(`    ${docsURL}`);
+}
+
+function printNextSteps() {
+  console.error("");
+  console.error("cux: next steps");
+  console.error("  1. Run `cux setup` to install /switch, /cux:* and Claude Code hooks.");
+  console.error("  2. Run `cux add` while logged in to each Claude account.");
+  console.error("  3. Start Claude with `cux` instead of `claude`.");
+  console.error("");
+  console.error(`Docs: ${docsURL}`);
+  console.error(`Support development: ${supportURL}`);
+  npmGlobalBinHint();
+}
+
 async function main() {
   const binURL = `${baseURL}/${asset}`;
   const sumURL = `${binURL}.sha256`;
@@ -134,11 +193,7 @@ async function main() {
     chmodSync(binPath, 0o755);
   }
   console.error(`cux ${version} installed at ${binPath}`);
-  console.error("");
-  console.error("cux: next steps");
-  console.error("  1. Run `cux setup` to install /switch, /cux:* and Claude Code hooks.");
-  console.error("  2. Run `cux add` while logged in to each Claude account.");
-  console.error("  3. Start Claude with `cux` instead of `claude`.");
+  printNextSteps();
 }
 
 main().catch((e) => {

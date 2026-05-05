@@ -12,6 +12,10 @@
     "oauth"
   ],
   "homepage": "https://cux.inulute.com",
+  "funding": {
+    "type": "individual",
+    "url": "https://support.inulute.com"
+  },
   "bugs": {
     "url": "https://github.com/inulute/cux/issues"
   },
