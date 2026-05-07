@@ -25,8 +25,19 @@ type Account struct {
 	Slot     int       `json:"slot"`
 	Email    string    `json:"email"`
 	UUID     string    `json:"uuid"`
+	OrgUUID  string    `json:"orgUuid,omitempty"`
 	AddedAt  time.Time `json:"addedAt"`
 	LastUsed time.Time `json:"lastUsed,omitempty"`
+}
+
+// CacheKey returns the usage-cache key for this account. When OrgUUID is
+// set it is used as the key so two accounts sharing the same email get
+// independent cache entries. Falls back to email for legacy slots.
+func (a Account) CacheKey() string {
+	if a.OrgUUID != "" {
+		return a.OrgUUID
+	}
+	return a.Email
 }
 
 // State is the on-disk shape of state.json.
@@ -151,6 +162,27 @@ func (s *State) FindByEmail(email string) int {
 	return 0
 }
 
+// FindByIdentity returns the slot matching email+orgUUID. When orgUUID is
+// non-empty it prefers an exact (email+org) match; when no exact match is
+// found it falls back to an email-only match against legacy slots that have
+// no OrgUUID stored. Returns 0 if no match is found.
+func (s *State) FindByIdentity(email, orgUUID string) int {
+	if orgUUID != "" {
+		for slot, a := range s.Accounts {
+			if a.Email == email && a.OrgUUID == orgUUID {
+				return slot
+			}
+		}
+	}
+	// Fall back to email-only for legacy slots (OrgUUID was not stored).
+	for slot, a := range s.Accounts {
+		if a.Email == email && a.OrgUUID == "" {
+			return slot
+		}
+	}
+	return 0
+}
+
 // Resolve accepts either a slot number ("2") or an email and returns
 // the matching account. Returns ErrAccountMissing if neither matches.
 func (s *State) Resolve(identifier string) (Account, error) {
@@ -187,20 +219,21 @@ func (s *State) NextSlot() int {
 // Add registers a new account in state. The caller is responsible for
 // having already saved its credentials and oauthAccount block via
 // creds.WriteBackup and store.WriteOAuthBlockBackup.
-func (s *State) Add(slot int, email, uuid string) error {
+func (s *State) Add(slot int, email, uuid, orgUUID string) error {
 	if err := ValidateEmail(email); err != nil {
 		return err
 	}
 	if _, exists := s.Accounts[slot]; exists {
 		return fmt.Errorf("%w: slot %d already in use", ErrAccountExists, slot)
 	}
-	if existing := s.FindByEmail(email); existing != 0 {
+	if existing := s.FindByIdentity(email, orgUUID); existing != 0 {
 		return fmt.Errorf("%w: %s is already slot %d", ErrAccountExists, email, existing)
 	}
 	s.Accounts[slot] = Account{
 		Slot:    slot,
 		Email:   email,
 		UUID:    uuid,
+		OrgUUID: orgUUID,
 		AddedAt: time.Now().UTC(),
 	}
 	s.Sequence = append(s.Sequence, slot)

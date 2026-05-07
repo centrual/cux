@@ -1021,6 +1021,7 @@ func cmdUsage(args []string) {
 
 func runWrapper(argv []string) {
 	updateDone := startUpdateCheck()
+	printCachedUpdateNotice()
 	warnIfSetupMissing()
 	bin := os.Getenv("CUX_CLAUDE_BIN")
 	if bin == "" {
@@ -1088,17 +1089,27 @@ func startUpdateCheck() <-chan updater.Result {
 	}
 	cadenceHours := cfg.UpdateCheck.CadenceHours
 	if cadenceHours < 1 {
-		cadenceHours = 24
+		cadenceHours = 6
 	}
 	done := make(chan updater.Result, 1)
 	go func() {
-		r, _, err := updater.CachedCheck(version, time.Duration(cadenceHours)*time.Hour)
-		if err == nil && r.HasUpdate() {
+		r, fresh, err := updater.CachedCheck(version, time.Duration(cadenceHours)*time.Hour)
+		if err == nil && fresh && r.HasUpdate() {
 			done <- r
 		}
 		close(done)
 	}()
 	return done
+}
+
+func printCachedUpdateNotice() {
+	cfg, err := config.Load()
+	if err != nil || !cfg.UpdateCheck.Enabled {
+		return
+	}
+	if r, ok := updater.CachedResult(version); ok && r.HasUpdate() {
+		fmt.Fprintf(os.Stderr, "cux: %s available — run cux upgrade.\n", r.Latest)
+	}
 }
 
 func printUpdateResult(done <-chan updater.Result) {
@@ -1274,7 +1285,7 @@ func offerUpdateCheckOptIn() error {
 	answer := strings.ToLower(strings.TrimSpace(line))
 	cfg.UpdateCheck.Enabled = answer == "y" || answer == "yes"
 	if cfg.UpdateCheck.CadenceHours < 1 {
-		cfg.UpdateCheck.CadenceHours = 24
+		cfg.UpdateCheck.CadenceHours = 6
 	}
 	if err := config.Save(cfg); err != nil {
 		return err
@@ -1541,7 +1552,7 @@ func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usa
 
 	for _, slot := range slots {
 		a := st.Accounts[slot]
-		au := cache[a.Email]
+		au := cache[a.CacheKey()]
 		sl := accountState(a.Email, liveEmail, au)
 
 		var sc string

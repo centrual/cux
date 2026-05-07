@@ -17,6 +17,7 @@ package monitor
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/inulute/cux/internal/claudecfg"
@@ -34,6 +35,9 @@ const lockTimeout = 10 * time.Second
 // errors so the caller can surface them without aborting the whole
 // refresh — one expired token shouldn't poison the others.
 func RefreshAll() (usage.Cache, []error) {
+	if err := os.MkdirAll(paths.BackupRoot(), 0o700); err != nil {
+		return nil, []error{fmt.Errorf("monitor: mkdir data dir: %w", err)}
+	}
 	lk, err := lockfile.Acquire(paths.LockFile(), lockTimeout)
 	if err != nil {
 		return nil, []error{fmt.Errorf("monitor: acquire lock: %w", err)}
@@ -44,23 +48,26 @@ func RefreshAll() (usage.Cache, []error) {
 	if err != nil {
 		return nil, []error{err}
 	}
-	cache, _ := usage.LoadCache()
+	cache, cacheErr := usage.LoadCache()
+	if cacheErr != nil {
+		return nil, []error{cacheErr}
+	}
 	if cache == nil {
 		cache = usage.Cache{}
 	}
 	var errs []error
 	for slot, a := range state.Accounts {
-		entry, err := refreshOne(slot, a.Email)
+		entry, err := refreshOne(slot, a.Email, a.OrgUUID)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", a.Email, err))
 			// On token-expired we still cache the marker so `cux list`
 			// surfaces the state to the user.
 			if entry.TokenExpired {
-				cache[a.Email] = entry
+				cache[a.CacheKey()] = entry
 			}
 			continue
 		}
-		cache[a.Email] = entry
+		cache[a.CacheKey()] = entry
 	}
 	if err := usage.SaveCache(cache); err != nil {
 		errs = append(errs, err)
@@ -74,6 +81,9 @@ func RefreshAll() (usage.Cache, []error) {
 func RefreshActive(email string) error {
 	if email == "" {
 		return errors.New("monitor: empty email")
+	}
+	if err := os.MkdirAll(paths.BackupRoot(), 0o700); err != nil {
+		return fmt.Errorf("monitor: mkdir data dir: %w", err)
 	}
 	lk, err := lockfile.Acquire(paths.LockFile(), lockTimeout)
 	if err != nil {
@@ -89,8 +99,12 @@ func RefreshActive(email string) error {
 	if slot == 0 {
 		return fmt.Errorf("monitor: %s not managed by cux", email)
 	}
-	entry, err := refreshOne(slot, email)
-	cache, _ := usage.LoadCache()
+	acct := state.Accounts[slot]
+	entry, err := refreshOne(slot, acct.Email, acct.OrgUUID)
+	cache, cacheErr := usage.LoadCache()
+	if cacheErr != nil {
+		return cacheErr
+	}
 	if cache == nil {
 		cache = usage.Cache{}
 	}
@@ -98,7 +112,7 @@ func RefreshActive(email string) error {
 		// Network blips shouldn't blow away the prior entry.
 		return err
 	}
-	cache[email] = entry
+	cache[acct.CacheKey()] = entry
 	return usage.SaveCache(cache)
 }
 
@@ -110,8 +124,8 @@ func RefreshActive(email string) error {
 //     and update the backup so the next call is already fresh.
 //  2. If the API still returns 401 (e.g. the refresh token itself expired):
 //     fall back to the live credentials file, but only when the live account
-//     email matches, to avoid using a different account's token.
-func refreshOne(slot int, email string) (usage.AccountUsage, error) {
+//     email and orgUUID match, to avoid using a different account's token.
+func refreshOne(slot int, email, orgUUID string) (usage.AccountUsage, error) {
 	blob, err := creds.ReadBackup(slot, email)
 	if err != nil {
 		return usage.AccountUsage{}, err
@@ -128,6 +142,9 @@ func refreshOne(slot int, email string) (usage.AccountUsage, error) {
 				// token we cannot save.
 				return usage.AccountUsage{}, fmt.Errorf("monitor: save refreshed token: %w", writeErr)
 			}
+			if _, writeErr := syncLiveIfActive(email, orgUUID, freshBlob); writeErr != nil {
+				return usage.AccountUsage{}, fmt.Errorf("monitor: save refreshed live token: %w", writeErr)
+			}
 			blob = freshBlob
 		}
 		// If RefreshBlob failed, continue with the existing blob — the API
@@ -140,6 +157,9 @@ func refreshOne(slot int, email string) (usage.AccountUsage, error) {
 	}
 	u, err := usage.Fetch(token)
 	if err == nil {
+		if _, writeErr := syncLiveIfActive(email, orgUUID, blob); writeErr != nil {
+			return usage.AccountUsage{}, fmt.Errorf("monitor: save active live token: %w", writeErr)
+		}
 		return u, nil
 	}
 	if !u.TokenExpired {
@@ -158,6 +178,10 @@ func refreshOne(slot int, email string) (usage.AccountUsage, error) {
 	if cfgErr != nil || parsed.EmailAddress != email {
 		return u, err
 	}
+	// When orgUUID is set, also verify the live account belongs to the same org.
+	if orgUUID != "" && parsed.OrganizationUUID != orgUUID {
+		return u, err
+	}
 	liveToken, tokErr := creds.ExtractAccessToken(liveBlob)
 	if tokErr != nil {
 		return u, err
@@ -170,4 +194,26 @@ func refreshOne(slot int, email string) (usage.AccountUsage, error) {
 	// Best-effort: if this fails we still return the valid usage data.
 	_ = creds.WriteBackup(slot, email, liveBlob)
 	return u2, nil
+}
+
+func syncLiveIfActive(email, orgUUID, blob string) (bool, error) {
+	if email == "" || blob == "" {
+		return false, nil
+	}
+	_, parsed, err := claudecfg.ReadOAuthBlock()
+	if err != nil {
+		return false, nil
+	}
+	if parsed.EmailAddress != email {
+		return false, nil
+	}
+	// When orgUUID is set, also verify the live account is the same org to
+	// avoid syncing a refreshed token onto a different account sharing the email.
+	if orgUUID != "" && parsed.OrganizationUUID != orgUUID {
+		return false, nil
+	}
+	if err := creds.WriteLive(blob); err != nil {
+		return false, err
+	}
+	return true, nil
 }

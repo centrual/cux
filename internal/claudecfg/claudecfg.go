@@ -22,8 +22,9 @@ import (
 // accounts by. The block has more fields in practice; we copy them all
 // through unchanged via json.RawMessage rather than modelling them.
 type OAuthAccount struct {
-	EmailAddress string `json:"emailAddress"`
-	AccountUUID  string `json:"accountUuid"`
+	EmailAddress     string `json:"emailAddress"`
+	AccountUUID      string `json:"accountUuid"`
+	OrganizationUUID string `json:"organizationUuid"`
 }
 
 // ErrNoConfig is returned when Claude Code's config file does not exist

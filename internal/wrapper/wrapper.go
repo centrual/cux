@@ -425,7 +425,7 @@ func step(
 // decided to leave. Best-effort; if the cache is empty the entry just
 // shows zero usage which the history printer renders as "—".
 func snapshotActiveUsage() usage.AccountUsage {
-	email, err := switcher.CurrentLiveEmail()
+	cacheKey, err := switcher.CurrentLiveCacheKey()
 	if err != nil {
 		return usage.AccountUsage{}
 	}
@@ -433,7 +433,7 @@ func snapshotActiveUsage() usage.AccountUsage {
 	if err != nil {
 		return usage.AccountUsage{}
 	}
-	return cache[email]
+	return cache[cacheKey]
 }
 
 // evaluateThresholdSwap returns a pending if the active account's
@@ -466,7 +466,11 @@ func evaluateThresholdSwap(cfg *config.Config, manualTarget string) *pending {
 	if err != nil || cache == nil {
 		return nil
 	}
-	u, ok := cache[email]
+	cacheKey, err := switcher.CurrentLiveCacheKey()
+	if err != nil {
+		return nil
+	}
+	u, ok := cache[cacheKey]
 	if !ok {
 		return nil
 	}
@@ -480,10 +484,10 @@ func evaluateThresholdSwap(cfg *config.Config, manualTarget string) *pending {
 	}
 	candidates := make([]strategy.Candidate, 0, len(state.Accounts))
 	for _, a := range state.Accounts {
-		candidates = append(candidates, strategy.Candidate{Email: a.Email})
+		candidates = append(candidates, strategy.Candidate{Email: a.Email, CacheKey: a.CacheKey()})
 	}
 	pick, ok := strategy.PickNext(cfg.ResolvedStrategy(), cfg.Strategy.Order, candidates,
-		strategy.Candidate{Email: email}, cache, cfg.Thresholds)
+		strategy.Candidate{Email: email, CacheKey: cacheKey}, cache, cfg.Thresholds)
 	if !ok {
 		// Nothing to swap to — let claude continue on the maxed-out
 		// account; the rate-limit hook will catch the actual cap.
@@ -552,6 +556,10 @@ func resolveTarget(explicit string, trigger history.Trigger, cfg *config.Config)
 		return "", errors.New("only one account is managed; nothing to rotate to")
 	}
 	current, _ := switcher.CurrentLiveEmail()
+	currentCacheKey, _ := switcher.CurrentLiveCacheKey()
+	if currentCacheKey == "" {
+		currentCacheKey = current
+	}
 
 	// Try strategy first.
 	cache, _ := usage.LoadCache()
@@ -560,7 +568,7 @@ func resolveTarget(explicit string, trigger history.Trigger, cfg *config.Config)
 	}
 	candidates := make([]strategy.Candidate, 0, len(state.Accounts))
 	for _, a := range state.Accounts {
-		candidates = append(candidates, strategy.Candidate{Email: a.Email})
+		candidates = append(candidates, strategy.Candidate{Email: a.Email, CacheKey: a.CacheKey()})
 	}
 	// In manual mode strategy.PickNext returns ok=false, but a manual
 	// trigger with no explicit target still means "rotate" — fall
@@ -570,7 +578,7 @@ func resolveTarget(explicit string, trigger history.Trigger, cfg *config.Config)
 		return rotateFallback(state, cache, cfg)
 	}
 	if pick, ok := strategy.PickNext(kind, cfg.Strategy.Order, candidates,
-		strategy.Candidate{Email: current}, cache, cfg.Thresholds); ok {
+		strategy.Candidate{Email: current, CacheKey: currentCacheKey}, cache, cfg.Thresholds); ok {
 		return pick.Email, nil
 	}
 	return rotateFallback(state, cache, cfg)
@@ -585,7 +593,7 @@ func rotateFallback(state *store.State, cache usage.Cache, cfg *config.Config) (
 		if !ok || slot == state.ActiveSlot {
 			continue
 		}
-		if accountHasSwitchCapacity(cache, acct.Email, cfg) {
+		if accountHasSwitchCapacity(cache, acct.CacheKey(), cfg) {
 			return strconv.Itoa(slot), nil
 		}
 	}
@@ -604,8 +612,8 @@ func rotationSlots(state *store.State) []int {
 	return slots
 }
 
-func accountHasSwitchCapacity(cache usage.Cache, email string, cfg *config.Config) bool {
-	u, ok := cache[email]
+func accountHasSwitchCapacity(cache usage.Cache, cacheKey string, cfg *config.Config) bool {
+	u, ok := cache[cacheKey]
 	if !ok {
 		return true
 	}

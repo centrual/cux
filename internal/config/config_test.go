@@ -33,8 +33,8 @@ func TestDefaultsLoaded_WhenFileMissing(t *testing.T) {
 	if c.UpdateCheck.Enabled {
 		t.Error("update_check.enabled should default to false")
 	}
-	if c.UpdateCheck.CadenceHours != 24 {
-		t.Errorf("update_check.cadence_hours = %d, want 24", c.UpdateCheck.CadenceHours)
+	if c.UpdateCheck.CadenceHours != 6 {
+		t.Errorf("update_check.cadence_hours = %d, want 6", c.UpdateCheck.CadenceHours)
 	}
 }
 

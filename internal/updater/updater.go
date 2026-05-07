@@ -52,6 +52,21 @@ type Cache struct {
 	HTMLURL string    `json:"htmlUrl"`
 }
 
+// CachedResult returns the last cached release check without making a
+// network call. The bool return is false when there is no usable cache.
+func CachedResult(current string) (Result, bool) {
+	cache, err := loadCache()
+	if err != nil || cache == nil {
+		return Result{}, false
+	}
+	return Result{
+		Current: stripV(current),
+		Latest:  stripV(cache.Latest),
+		HTMLURL: cache.HTMLURL,
+		Polled:  cache.Polled,
+	}, true
+}
+
 // CachedCheck returns a Result for `current` using a recent cache when
 // available, otherwise a fresh API call. The bool return is true iff a
 // fresh API call was actually made (so callers can avoid double-fetching

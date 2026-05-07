@@ -23,7 +23,21 @@
       "Bash(/tmp/cux-test config *)",
       "Bash(node -e \"const p=require\\('./npm/package.json'\\); console.log\\(p.version\\)\")",
       "Bash(echo \"npm version: $\\(node -e \"const p=require\\('./npm/package.json'\\); console.log\\(p.version\\)\"\\)\")",
-      "Bash(/tmp/cux-test setup *)"
+      "Bash(/tmp/cux-test setup *)",
+      "Bash(sed -n '54,80p' /home/osx/Github/claude-switch/cux/cmd/cux/main.go)",
+      "Bash(sed -n '95,145p' /home/osx/Github/claude-switch/cux/cmd/cux/main.go)",
+      "Bash(sed -n '395,415p' /home/osx/Github/claude-switch/cux/cmd/cux/main.go)",
+      "Bash(/tmp/cux-test docs *)",
+      "Bash(/tmp/cux-test help *)",
+      "Bash(npm run *)",
+      "Bash(xargs ls *)",
+      "Bash(git -C /home/osx/Github/claude-switch/cux log --oneline -3)",
+      "Bash(git -C /home/osx/Github/cux-website log --oneline -3)",
+      "Bash(git stash *)",
+      "Bash(go clean *)",
+      "Bash(/tmp/cux-test --version)",
+      "Bash(gh issue *)",
+      "Bash(node *)"
     ]
   }
 }

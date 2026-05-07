@@ -1,6 +1,10 @@
 package updater
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func TestIsNewer(t *testing.T) {
 	cases := []struct {
@@ -31,5 +35,31 @@ func TestResultHasUpdateStripsV(t *testing.T) {
 	r := Result{Current: "v0.2.0", Latest: "v0.3.0"}
 	if !r.HasUpdate() {
 		t.Fatal("expected v0.3.0 to be newer than v0.2.0")
+	}
+}
+
+func TestCachedResultDoesNotRequireNetwork(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, ".local", "share"))
+
+	polled := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+	if err := saveCache(Cache{
+		Polled:  polled,
+		Latest:  "v0.3.0",
+		HTMLURL: "https://example.com/release",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r, ok := CachedResult("v0.2.5")
+	if !ok {
+		t.Fatal("expected cached result")
+	}
+	if !r.HasUpdate() {
+		t.Fatalf("expected cached result to report update: %+v", r)
+	}
+	if r.Current != "0.2.5" || r.Latest != "0.3.0" || r.HTMLURL != "https://example.com/release" || !r.Polled.Equal(polled) {
+		t.Fatalf("unexpected cached result: %+v", r)
 	}
 }

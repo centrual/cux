@@ -57,7 +57,7 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 		return store.Account{}, false, err
 	}
 
-	if existing := state.FindByEmail(parsed.EmailAddress); existing != 0 {
+	if existing := state.FindByIdentity(parsed.EmailAddress, parsed.OrganizationUUID); existing != 0 {
 		// Refresh: overwrite backups for this slot, no state shape change.
 		acct := state.Accounts[existing]
 		if err := creds.WriteBackup(existing, acct.Email, liveCreds); err != nil {
@@ -90,7 +90,7 @@ func AddCurrent(preferredSlot int) (added store.Account, refreshed bool, err err
 		_ = creds.DeleteBackup(slot, parsed.EmailAddress)
 		return store.Account{}, false, err
 	}
-	if err := state.Add(slot, parsed.EmailAddress, parsed.AccountUUID); err != nil {
+	if err := state.Add(slot, parsed.EmailAddress, parsed.AccountUUID, parsed.OrganizationUUID); err != nil {
 		_ = creds.DeleteBackup(slot, parsed.EmailAddress)
 		_ = store.DeleteOAuthBlockBackup(slot, parsed.EmailAddress)
 		return store.Account{}, false, err
@@ -149,7 +149,7 @@ func SwitchTo(identifier string) (from, to store.Account, err error) {
 	currentRaw, currentParsed, cfgErr := claudecfg.ReadOAuthBlock()
 	var current store.Account
 	if liveErr == nil && cfgErr == nil {
-		if slot := state.FindByEmail(currentParsed.EmailAddress); slot != 0 {
+		if slot := state.FindByIdentity(currentParsed.EmailAddress, currentParsed.OrganizationUUID); slot != 0 {
 			current = state.Accounts[slot]
 			if err := creds.WriteBackup(slot, current.Email, currentLive); err != nil {
 				return store.Account{}, store.Account{}, fmt.Errorf("backing up current creds: %w", err)
@@ -235,6 +235,18 @@ func CurrentLiveEmail() (string, error) {
 		return "", err
 	}
 	return parsed.EmailAddress, nil
+}
+
+// CurrentLiveCacheKey returns the usage-cache key for the currently active
+// account. When the account has an organizationUuid that is used; otherwise
+// the email is returned for backward compatibility.
+func CurrentLiveCacheKey() (string, error) {
+	_, parsed, err := claudecfg.ReadOAuthBlock()
+	if err != nil {
+		return "", err
+	}
+	acct := store.Account{Email: parsed.EmailAddress, OrgUUID: parsed.OrganizationUUID}
+	return acct.CacheKey(), nil
 }
 
 func ensureBackupRoot() error {

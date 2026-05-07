@@ -262,7 +262,7 @@ cux config set update_check.enabled true            # opt in to update checks
 | `auto_resume`                 | `true`         | Pass `--resume <id>` to the relaunched claude |
 | `auto_message`                | `Go continue.` | First user turn after auto-swap; `""` = silent |
 | `update_check.enabled`        | `false`        | Check GitHub for newer cux releases on startup |
-| `update_check.cadence_hours`  | `24`           | Minimum hours between update checks (cached locally) |
+| `update_check.cadence_hours`  | `6`            | Minimum hours between update checks (cached locally) |
 
 Config file: `~/.config/cux/config.json` (XDG-aware).
 

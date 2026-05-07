@@ -89,7 +89,7 @@ func Defaults() Config {
 		AutoMessage:           "Go continue.",
 		Notify:                true,
 		PollIntervalSeconds:   60,
-		UpdateCheck:           UpdateCheckConfig{Enabled: false, CadenceHours: 24},
+		UpdateCheck:           UpdateCheckConfig{Enabled: false, CadenceHours: 6},
 		Theme:                 "claude",
 	}
 }
@@ -314,7 +314,7 @@ func Keys(c Config) []KeyInfo {
 			Current:     strconv.FormatBool(c.UpdateCheck.Enabled),
 		},
 		{
-			Key: "update_check.cadence_hours", Default: "24",
+			Key: "update_check.cadence_hours", Default: "6",
 			Description: "minimum hours between update checks (cached locally)",
 			Current:     strconv.Itoa(c.UpdateCheck.CadenceHours),
 		},

@@ -71,7 +71,18 @@ func ParseKind(s string) Kind {
 // Candidate is the minimal account shape strategy needs. The wrapper
 // converts its store.Account list into Candidates before calling.
 type Candidate struct {
-	Email string
+	Email    string
+	CacheKey string // usage-cache key; falls back to Email when empty
+}
+
+// cacheKey returns the key to use for cache lookups. When CacheKey is set
+// (e.g. organizationUuid for accounts sharing an email) it is used; otherwise
+// Email is used for backward compatibility.
+func (c Candidate) cacheKey() string {
+	if c.CacheKey != "" {
+		return c.CacheKey
+	}
+	return c.Email
 }
 
 // Pick is the strategy's answer. Reason is a short human-readable
@@ -137,10 +148,10 @@ func ShouldRebalance(
 			if c == nil {
 				continue
 			}
-			if !isAvailable(cache, c.Email) {
+			if !isAvailable(cache, c.cacheKey()) {
 				continue
 			}
-			if u, ok := cache[c.Email]; ok {
+			if u, ok := cache[c.cacheKey()]; ok {
 				if over, _ := usage.IsOverThreshold(u, thresholds); over {
 					continue
 				}
@@ -158,15 +169,15 @@ func ShouldRebalance(
 			if c.Email == current.Email {
 				continue
 			}
-			if !isAvailable(cache, c.Email) {
+			if !isAvailable(cache, c.cacheKey()) {
 				continue
 			}
-			if u, ok := cache[c.Email]; ok {
+			if u, ok := cache[c.cacheKey()]; ok {
 				if over, _ := usage.IsOverThreshold(u, thresholds); over {
 					continue
 				}
 			}
-			u := sevenDayUtil(cache, c.Email)
+			u := sevenDayUtil(cache, c.cacheKey())
 			if u > bestUtil {
 				bestUtil = u
 				best = c
@@ -205,10 +216,10 @@ func pickDrain(
 		cap5 = 90
 	}
 	for _, c := range ordered {
-		if !isAvailable(cache, c.Email) {
+		if !isAvailable(cache, c.cacheKey()) {
 			continue
 		}
-		if fiveHourUtil(cache, c.Email) < float64(cap5) && sevenDayUtil(cache, c.Email) < float64(cap7) {
+		if fiveHourUtil(cache, c.cacheKey()) < float64(cap5) && sevenDayUtil(cache, c.cacheKey()) < float64(cap7) {
 			return Pick{Email: c.Email, Reason: "drain: 7d under cap"}, true
 		}
 	}
@@ -217,10 +228,10 @@ func pickDrain(
 	// A 7D-at-100% account has no recoverable capacity in this window
 	// regardless of 5h utilisation.
 	for _, c := range ordered {
-		if !isAvailable(cache, c.Email) {
+		if !isAvailable(cache, c.cacheKey()) {
 			continue
 		}
-		if fiveHourUtil(cache, c.Email) < float64(cap5) && sevenDayUtil(cache, c.Email) < 100 {
+		if fiveHourUtil(cache, c.cacheKey()) < float64(cap5) && sevenDayUtil(cache, c.cacheKey()) < 100 {
 			return Pick{Email: c.Email, Reason: "drain: 5h has room"}, true
 		}
 	}
@@ -234,13 +245,13 @@ func pickBalanced(accounts []Candidate, current Candidate, cache usage.Cache, th
 		if c.Email == current.Email {
 			continue
 		}
-		if !isAvailable(cache, c.Email) {
+		if !isAvailable(cache, c.cacheKey()) {
 			continue
 		}
-		if !hasFiveHourCapacity(cache, c.Email, thresholds) {
+		if !hasFiveHourCapacity(cache, c.cacheKey(), thresholds) {
 			continue
 		}
-		if !hasSevenDayCapacity(cache, c.Email) {
+		if !hasSevenDayCapacity(cache, c.cacheKey()) {
 			continue
 		}
 		candidates = append(candidates, c)
@@ -249,11 +260,11 @@ func pickBalanced(accounts []Candidate, current Candidate, cache usage.Cache, th
 		return Pick{}, false
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		ai, bi := sevenDayUtil(cache, candidates[i].Email), sevenDayUtil(cache, candidates[j].Email)
+		ai, bi := sevenDayUtil(cache, candidates[i].cacheKey()), sevenDayUtil(cache, candidates[j].cacheKey())
 		if ai != bi {
 			return ai < bi
 		}
-		return fiveHourUtil(cache, candidates[i].Email) < fiveHourUtil(cache, candidates[j].Email)
+		return fiveHourUtil(cache, candidates[i].cacheKey()) < fiveHourUtil(cache, candidates[j].cacheKey())
 	})
 	return Pick{Email: candidates[0].Email, Reason: "balanced: lowest 7d"}, true
 }
@@ -272,7 +283,7 @@ func orderedCandidates(order []string, accounts []Candidate, current Candidate, 
 			out = append(out, c)
 		}
 		sort.SliceStable(out, func(i, j int) bool {
-			return sevenDayUtil(cache, out[i].Email) > sevenDayUtil(cache, out[j].Email)
+			return sevenDayUtil(cache, out[i].cacheKey()) > sevenDayUtil(cache, out[j].cacheKey())
 		})
 		return out
 	}
