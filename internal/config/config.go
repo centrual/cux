@@ -89,7 +89,7 @@ func Defaults() Config {
 		AutoMessage:           "Go continue.",
 		Notify:                true,
 		PollIntervalSeconds:   60,
-		UpdateCheck:           UpdateCheckConfig{Enabled: false, CadenceHours: 6},
+		UpdateCheck:           UpdateCheckConfig{Enabled: true, CadenceHours: 6},
 		Theme:                 "claude",
 	}
 }

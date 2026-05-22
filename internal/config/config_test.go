@@ -30,8 +30,8 @@ func TestDefaultsLoaded_WhenFileMissing(t *testing.T) {
 	if c.AutoMessage != def.AutoMessage {
 		t.Errorf("auto_message: got %q, want %q", c.AutoMessage, def.AutoMessage)
 	}
-	if c.UpdateCheck.Enabled {
-		t.Error("update_check.enabled should default to false")
+	if !c.UpdateCheck.Enabled {
+		t.Error("update_check.enabled should default to true")
 	}
 	if c.UpdateCheck.CadenceHours != 6 {
 		t.Errorf("update_check.cadence_hours = %d, want 6", c.UpdateCheck.CadenceHours)

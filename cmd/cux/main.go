@@ -42,8 +42,16 @@ import (
 	"golang.org/x/term"
 )
 
+// version is overridden at build time by the release workflow via:
+//
+//	-ldflags "-X main.version=X.Y.Z"
+//
+// It must be a var (not const) so -ldflags can inject the real release
+// tag. The fallback "0.2.6" is the development/unreleased default;
+// released binaries always get the tag stamped in.
+var version = "0.2.7"
+
 const (
-	version = "0.2.5"
 	// donateURL is shown only by `cux version --verbose`. Subtle by
 	// design — never printed during normal use, never injected into
 	// help output, never shown by the wrapper or the slash command.
@@ -366,7 +374,6 @@ func cmdInstallHooks(args []string) {
 		fmt.Println("All cux hooks already installed in ~/.claude/settings.json.")
 	} else {
 		fmt.Printf("Installed/updated hooks in ~/.claude/settings.json: %s\n", strings.Join(changed, ", "))
-		fmt.Println("Restart Claude Code for the new hooks to take effect.")
 	}
 }
 
@@ -1150,42 +1157,50 @@ func cmdSetup(args []string) {
 	} else {
 		fmt.Printf("✓ Installed hooks: %s\n", strings.Join(changed, ", "))
 	}
-	if err := offerUpdateCheckOptIn(); err != nil {
+	if err := enableUpdateChecks(); err != nil {
 		fail(err)
 	}
-	if err := offerConfigSetup(); err != nil {
-		fail(err)
-	}
+	printSetupFooter()
+}
+
+// printSetupFooter prints the post-install next-steps, help hint,
+// GitHub star ask, and support link.
+func printSetupFooter() {
+	g, r, b := colorGray, colorReset, colorBold
+
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  1. Run `cux add` or `/cux:add` while logged in to each account you want to manage.")
-	fmt.Println("  2. Restart Claude Code (or start a new session) so it picks up the hooks.")
-	fmt.Println("  3. Launch sessions with `cux` instead of `claude`, then use /switch and /cux:* inside.")
+	fmt.Println("  2. Use `cux` instead of `claude` to start sessions.")
+	fmt.Println("  3. Use /switch or /cux:* inside Claude to manage accounts.")
+	fmt.Println()
+	fmt.Printf("  %sRun `cux help` to see all available commands.%s\n", b, r)
+	fmt.Println()
+	fmt.Printf("%s────────────────────────────────────────────────%s\n", g, r)
+	fmt.Printf("  %s⭐  Enjoying cux? Star the repo on GitHub:%s\n", b, r)
+	fmt.Println("     https://github.com/inulute/cux")
+	fmt.Println()
+	fmt.Println("  💛  Support development:")
+	fmt.Println("     https://support.inulute.com")
+	fmt.Printf("%s────────────────────────────────────────────────%s\n", g, r)
+	fmt.Println()
 }
 
-// offerConfigSetup shows the current config summary and offers to open
-// the interactive editor so users can tune settings during first-run setup.
-func offerConfigSetup() error {
-	if !stdinIsTTY() {
-		return nil
-	}
-	c, err := config.Load()
+// enableUpdateChecks silently ensures update checks are on in the saved
+// config. No output — it's a background concern, not a user-facing step.
+func enableUpdateChecks() error {
+	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	setTheme(c.Theme)
-	fmt.Println()
-	printSetupConfigSummary(c)
-	fmt.Print("Customize these settings now? [y/N] ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return err
+	if cfg.UpdateCheck.Enabled && cfg.UpdateCheck.CadenceHours >= 1 {
+		return nil
 	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	if answer == "y" || answer == "yes" {
-		return editConfigInteractive()
+	cfg.UpdateCheck.Enabled = true
+	if cfg.UpdateCheck.CadenceHours < 1 {
+		cfg.UpdateCheck.CadenceHours = 6
 	}
-	return nil
+	return config.Save(cfg)
 }
 
 // printSetupConfigSummary renders a compact table of the most important
@@ -1268,35 +1283,7 @@ func stripANSI(s string) string {
 	return string(out)
 }
 
-func offerUpdateCheckOptIn() error {
-	if !stdinIsTTY() {
-		return nil
-	}
-	fmt.Println()
-	fmt.Print("Check for cux updates daily on startup? [y/N] ")
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return err
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	cfg.UpdateCheck.Enabled = answer == "y" || answer == "yes"
-	if cfg.UpdateCheck.CadenceHours < 1 {
-		cfg.UpdateCheck.CadenceHours = 6
-	}
-	if err := config.Save(cfg); err != nil {
-		return err
-	}
-	if cfg.UpdateCheck.Enabled {
-		fmt.Println("✓ Daily update checks enabled")
-	} else {
-		fmt.Println("✓ Daily update checks disabled")
-	}
-	return nil
-}
+
 
 func stdinIsTTY() bool {
 	fi, err := os.Stdin.Stat()
@@ -1312,28 +1299,29 @@ func cmdUpgrade(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	kind, installDir := detectInstall(exe)
-	switch kind {
-	case "npm":
+
+	if isNPMInstall(filepath.Dir(exe)) {
+		// npm manages its own package metadata (package.json, bin shims,
+		// postinstall scripts), so let npm do the upgrade itself.
 		runUpgradeCommand("npm", "install", "-g", "@inulute/cux@latest")
-	case "installer":
-		cmd := exec.Command("sh", "-c", "curl -fsSL https://raw.githubusercontent.com/inulute/cux/main/scripts/install.sh | sh")
-		cmd.Env = append(os.Environ(), "CUX_INSTALL_DIR="+installDir)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.Stdin = os.Stdin
-		if err := cmd.Run(); err != nil {
+	} else {
+		// For every other install method — shell installer, manual binary
+		// download, Homebrew tap, Windows, etc. — use the built-in Go
+		// self-updater: no sh, no curl, no PowerShell required.
+		if err := updater.SelfUpdate(exe); err != nil {
 			fail(err)
 		}
-	default:
-		fmt.Println("cux: could not detect how this binary was installed.")
-		fmt.Println()
-		fmt.Println("If you installed with npm, run:")
-		fmt.Println("  npm install -g @inulute/cux@latest")
-		fmt.Println()
-		fmt.Println("If you installed with the shell installer, run:")
-		fmt.Println("  curl -fsSL https://raw.githubusercontent.com/inulute/cux/main/scripts/install.sh | sh")
 	}
+	// Clear the on-disk cache so the next run re-fetches instead of
+	// immediately showing "update available" for the version just installed.
+	clearUpdateCache()
+}
+
+// clearUpdateCache removes the on-disk update cache so the next run
+// re-fetches from GitHub instead of showing a stale "update available"
+// notice for a release that was just installed.
+func clearUpdateCache() {
+	_ = os.Remove(updater.CachePath())
 }
 
 func runUpgradeCommand(name string, args ...string) {
@@ -1344,27 +1332,6 @@ func runUpgradeCommand(name string, args ...string) {
 	if err := cmd.Run(); err != nil {
 		fail(err)
 	}
-}
-
-func detectInstall(exe string) (kind, installDir string) {
-	exe, _ = filepath.Abs(exe)
-	dir := filepath.Dir(exe)
-	if isNPMInstall(dir) {
-		return "npm", ""
-	}
-	if envDir := os.Getenv("CUX_INSTALL_DIR"); envDir != "" {
-		if sameDir(dir, envDir) {
-			return "installer", dir
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err == nil {
-		localBin := filepath.Join(home, ".local", "bin")
-		if sameDir(dir, localBin) {
-			return "installer", dir
-		}
-	}
-	return "", ""
 }
 
 func isNPMInstall(binDir string) bool {

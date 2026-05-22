@@ -145,9 +145,14 @@ func fetchLatest(current string) (Result, error) {
 	}, nil
 }
 
-func cachePath() string {
+// CachePath returns the absolute path to the on-disk update cache file.
+// Exported so callers (e.g. cmdUpgrade) can remove it after a successful
+// upgrade to prevent a stale "update available" notice on the next run.
+func CachePath() string {
 	return filepath.Join(paths.RuntimeDir(), cacheFileName)
 }
+
+func cachePath() string { return CachePath() }
 
 func loadCache() (*Cache, error) {
 	b, err := os.ReadFile(cachePath())

@@ -161,14 +161,11 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			setManualSwitchState("")
 		}
 
-		canResume := sessionID != "" && cfg.AutoResume && (hadTurns || p.trigger == history.TriggerManual)
+		canResume := sessionID != "" && cfg.AutoResume && hadTurns
 		if canResume {
-			// Resume the existing session on the new account. For manual
-			// /switch we resume even when no turns have completed yet —
-			// the user explicitly requested a switch and expects to land
-			// back in the same session, not the welcome screen.
-			// For rate-limit and threshold swaps we require hadTurns so
-			// we don't pass --resume for an empty session that claude would reject.
+			// Only resume if at least one turn completed — an empty/just-started
+			// session has no transcript content and claude rejects --resume for it.
+			// This applies to all trigger types including manual /switch.
 			switch p.trigger {
 			case history.TriggerRateLimit:
 				fmt.Fprintf(w, "cux: rate limit on %s → swapped to %s, resuming…\n", from.Email, to.Email)

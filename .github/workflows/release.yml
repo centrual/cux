@@ -30,8 +30,12 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
+          # Strip the leading "v" from the tag (v0.2.6 → 0.2.6) so the
+          # binary's embedded version matches what the updater reads from
+          # the GitHub release tag.
+          VERSION="${GITHUB_REF_NAME#v}"
           out="cux-${GOOS}-${GOARCH}${{ matrix.suffix }}"
-          go build -trimpath -ldflags="-s -w" -o "$out" ./cmd/cux
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "$out" ./cmd/cux
           sha256sum "$out" > "$out.sha256"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
