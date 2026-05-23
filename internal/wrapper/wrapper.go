@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,22 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 
 		from, to, swapErr := switcher.SwitchTo(target)
 		if swapErr != nil {
+			// All Claude accounts exhausted — try Codex overflow if available.
+			if codexSlot := switcher.CodexFallbackSlot(); codexSlot != 0 {
+				cwd, _ := os.Getwd()
+				if memFile, mErr := switcher.MigrateToCodex(cwd, sessionID); mErr == nil {
+					codexBin, lErr := exec.LookPath("codex")
+					if lErr == nil {
+						fmt.Fprintf(w, "cux: all Claude accounts exhausted → migrating to Codex…\n")
+						fmt.Fprintf(w, "cux: conversation saved to %s\n", memFile)
+						claudeBin = codexBin
+						memName := filepath.Base(memFile)
+						resumeMsg := fmt.Sprintf("I've been migrated from Claude Code (all accounts rate-limited). Full conversation is in your memories as %q. Continue where we left off.", memName)
+						currentArgv = []string{resumeMsg}
+						continue
+					}
+				}
+			}
 			fmt.Fprintf(w, "cux: switch failed: %v\n", swapErr)
 			return 1, swapErr
 		}

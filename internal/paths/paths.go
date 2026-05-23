@@ -110,6 +110,12 @@ func LockFile() string     { return filepath.Join(BackupRoot(), ".lock") }
 
 // AccountDir is the per-account backup directory. The slot number is the
 // stable identifier; the email is included only as a human-readable hint.
+// CodexAuthFile is where the Codex CLI stores its live authentication.
+func CodexAuthFile() string { return filepath.Join(Home(), ".codex", "auth.json") }
+
+// CodexMemoriesDir is where Codex loads persistent memory files from.
+func CodexMemoriesDir() string { return filepath.Join(Home(), ".codex", "memories") }
+
 func AccountDir(slot int, email string) string {
 	// Sanitise the email so it cannot escape the directory or contain
 	// platform-illegal characters. Slot is the source of truth — email is

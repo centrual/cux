@@ -41,6 +41,9 @@ var cuxRemoveSlashCommand []byte
 //go:embed slashcmd_cux_usage_refresh.md
 var cuxUsageRefreshSlashCommand []byte
 
+//go:embed slashcmd_cux_codex_migrate.md
+var cuxCodexMigrateSlashCommand []byte
+
 func installSlashCommand() error {
 	dir := filepath.Join(paths.ClaudeDir(), "commands")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -62,7 +65,8 @@ func installSlashCommand() error {
 		"support.md":       cuxSupportSlashCommand,
 		"switch.md":        cuxSwitchSlashCommand,
 		"remove.md":        cuxRemoveSlashCommand,
-		"usage-refresh.md": cuxUsageRefreshSlashCommand,
+		"usage-refresh.md":   cuxUsageRefreshSlashCommand,
+		"codex-migrate.md":   cuxCodexMigrateSlashCommand,
 	}
 	for name, body := range commands {
 		if err := atomicfile.Write(filepath.Join(cuxDir, name), body, 0o600); err != nil {

@@ -87,7 +87,9 @@ var knownSubcommands = map[string]bool{
 	"-h":              true,
 	"version":         true,
 	"--version":       true,
-	"__slash-switch":  true,
+	"__slash-switch":        true,
+	"__codex-migrate":       true,
+	"codex":                 true,
 }
 
 func main() {
@@ -147,6 +149,10 @@ func main() {
 		cmdVersion(rest)
 	case "__slash-switch":
 		cmdSlashSwitch(rest)
+	case "__codex-migrate":
+		cmdCodexMigrateInternal(rest)
+	case "codex":
+		cmdCodex(rest)
 	}
 }
 
@@ -1564,6 +1570,192 @@ func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usa
 	fmt.Fprintln(w, tableSep("└", "┴", "┘"))
 }
 
+// --- Codex subcommands -------------------------------------------------------
+
+func cmdCodex(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: cux codex <add|list|remove|migrate>")
+		os.Exit(1)
+	}
+	sub := args[0]
+	rest := args[1:]
+	switch sub {
+	case "add":
+		cmdCodexAdd(rest)
+	case "list", "ls":
+		cmdCodexList(rest)
+	case "remove", "rm":
+		cmdCodexRemove(rest)
+	case "migrate":
+		cmdCodexMigrate(rest)
+	default:
+		fmt.Fprintf(os.Stderr, "cux codex: unknown subcommand %q\n", sub)
+		fmt.Fprintln(os.Stderr, "Usage: cux codex <add|list|remove|migrate>")
+		os.Exit(1)
+	}
+}
+
+func cmdCodexAdd(args []string) {
+	fs := flag.NewFlagSet("codex add", flag.ExitOnError)
+	slot := fs.Int("slot", 0, "specific slot number (default: next free)")
+	_ = fs.Parse(args)
+
+	acct, refreshed, err := switcher.AddCodexCurrent(*slot)
+	if err != nil {
+		fail(err)
+	}
+	if refreshed {
+		fmt.Printf("Refreshed Codex slot %d (%s).\n", acct.Slot, acct.UUID)
+	} else {
+		fmt.Printf("Added Codex slot %d (%s).\n", acct.Slot, acct.UUID)
+	}
+}
+
+func cmdCodexList(_ []string) {
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	var codexAccounts []store.Account
+	for _, a := range state.Accounts {
+		if a.IsCodex() {
+			codexAccounts = append(codexAccounts, a)
+		}
+	}
+	if len(codexAccounts) == 0 {
+		fmt.Println("No Codex accounts managed yet. Run `cux codex add` while logged in to Codex.")
+		return
+	}
+	fmt.Printf("%-6s  %-36s  %s\n", "SLOT", "ACCOUNT ID", "ADDED")
+	for _, a := range codexAccounts {
+		fmt.Printf("%-6d  %-36s  %s\n", a.Slot, a.UUID, a.AddedAt.Format("2006-01-02"))
+	}
+}
+
+func cmdCodexRemove(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: cux codex remove <slot>")
+		os.Exit(1)
+	}
+	state, err := store.Load()
+	if err != nil {
+		fail(err)
+	}
+	slotN, err := strconv.Atoi(args[0])
+	if err != nil {
+		fail(fmt.Errorf("invalid slot: %s", args[0]))
+	}
+	acct, ok := state.Accounts[slotN]
+	if !ok || !acct.IsCodex() {
+		fail(fmt.Errorf("no Codex account at slot %d", slotN))
+	}
+	if err := state.Remove(slotN); err != nil {
+		fail(err)
+	}
+	if err := state.Save(); err != nil {
+		fail(err)
+	}
+	fmt.Printf("Removed Codex slot %d (%s).\n", slotN, acct.UUID)
+}
+
+func cmdCodexMigrate(args []string) {
+	fs := flag.NewFlagSet("codex migrate", flag.ExitOnError)
+	sessionFlag := fs.String("session", "", "explicit session ID (default: auto-detect)")
+	_ = fs.Parse(args)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		fail(err)
+	}
+	sessionID := *sessionFlag
+	if sessionID == "" {
+		sessionID = os.Getenv("CLAUDE_SESSION_ID")
+	}
+	if sessionID == "" {
+		// Find the most recently modified JSONL in the transcript dir.
+		sessionID = latestSessionID(cwd)
+	}
+	if sessionID == "" {
+		fail(fmt.Errorf("could not detect active session — use --session <id>"))
+	}
+
+	memFile, err := switcher.MigrateToCodex(cwd, sessionID)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("cux: migrated session %s\n", sessionID)
+	fmt.Printf("cux: conversation saved to %s\n", memFile)
+
+	codexBin, err := exec.LookPath("codex")
+	if err != nil {
+		fmt.Println("cux: Codex binary not found — install it with: npm install -g @openai/codex")
+		fmt.Printf("cux: memory file is ready at %s\n", memFile)
+		return
+	}
+
+	memName := filepath.Base(memFile)
+	prompt := fmt.Sprintf("I've just migrated from a Claude Code session. The full conversation history is saved in your memories as %q. Please read it to get context and continue from where we left off.", memName)
+
+	cmd := exec.Command(codexBin, prompt)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if runErr := cmd.Run(); runErr != nil {
+		os.Exit(1)
+	}
+}
+
+// cmdCodexMigrateInternal is the internal variant called by the
+// /cux:codex-migrate slash command subprocess. It reads CLAUDE_SESSION_ID
+// from the environment (set by Claude Code for hook subprocesses).
+func cmdCodexMigrateInternal(_ []string) {
+	cwd, _ := os.Getwd()
+	sessionID := os.Getenv("CLAUDE_SESSION_ID")
+	if sessionID == "" {
+		sessionID = latestSessionID(cwd)
+	}
+	if sessionID == "" {
+		fmt.Fprintln(os.Stderr, "cux: could not detect active Claude session")
+		os.Exit(1)
+	}
+
+	memFile, err := switcher.MigrateToCodex(cwd, sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cux: migrate failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Session migrated to Codex memory: %s\n", memFile)
+	fmt.Println("Run `codex` or `cux codex migrate` to launch Codex and continue your conversation.")
+}
+
+// latestSessionID returns the session ID of the most recently modified JSONL
+// in the project's transcript directory, or "" if none found.
+func latestSessionID(cwd string) string {
+	dir := paths.ProjectTranscriptDir(cwd)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var (
+		newest    string
+		newestMod int64
+	)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if mod := fi.ModTime().UnixNano(); mod > newestMod {
+			newestMod = mod
+			newest = strings.TrimSuffix(e.Name(), ".jsonl")
+		}
+	}
+	return newest
+}
+
 func renderSupport(useANSI bool) string {
 	var b strings.Builder
 	b.WriteString(":: C U X   S U P P O R T ::\n\n")
@@ -1604,10 +1796,17 @@ USAGE
   cux hook <event>                  internal: invoked by Claude Code
   cux version                       print version
 
+CODEX INTEGRATION
+  cux codex add [--slot N]          register the currently-authenticated Codex account
+  cux codex list                    list managed Codex accounts
+  cux codex remove <slot>           forget a Codex account
+  cux codex migrate [--session ID]  export current Claude session to Codex memory
+                                    and launch Codex to continue the conversation
+
 INLINE SWITCHING
   Once set up, type /switch [<slot|email>] from inside a Claude Code
   session started via cux. You can also use /cux:switch, /cux:add,
   /cux:list, /cux:status, /cux:support, /cux:config, /cux:remove,
-  and /cux:usage-refresh from inside the
+  /cux:usage-refresh, and /cux:codex-migrate from inside the
   session. Manual and rate-limit swaps reconnect with --resume.`)
 }

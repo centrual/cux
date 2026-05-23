@@ -7,9 +7,13 @@ package switcher
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/inulute/cux/internal/claudecfg"
+	"github.com/inulute/cux/internal/claudeconv"
+	"github.com/inulute/cux/internal/codexcreds"
 	"github.com/inulute/cux/internal/creds"
 	"github.com/inulute/cux/internal/lockfile"
 	"github.com/inulute/cux/internal/paths"
@@ -247,6 +251,107 @@ func CurrentLiveCacheKey() (string, error) {
 	}
 	acct := store.Account{Email: parsed.EmailAddress, OrgUUID: parsed.OrganizationUUID}
 	return acct.CacheKey(), nil
+}
+
+// AddCodexCurrent reads the currently-authenticated Codex account from
+// ~/.codex/auth.json and registers it in cux. If the account is already
+// managed, its backup is refreshed in place.
+func AddCodexCurrent(preferredSlot int) (added store.Account, refreshed bool, err error) {
+	if err := ensureBackupRoot(); err != nil {
+		return store.Account{}, false, err
+	}
+	lk, err := lockfile.Acquire(paths.LockFile(), lockTimeout)
+	if err != nil {
+		return store.Account{}, false, err
+	}
+	defer lk.Unlock()
+
+	blob, accountID, err := codexcreds.ReadLive()
+	if err != nil {
+		if errors.Is(err, codexcreds.ErrNotFound) {
+			return store.Account{}, false, errors.New("no active Codex login found — run `codex login` first")
+		}
+		return store.Account{}, false, err
+	}
+
+	state, err := store.Load()
+	if err != nil {
+		return store.Account{}, false, err
+	}
+
+	if existing := state.FindCodexSlot(accountID); existing != 0 {
+		acct := state.Accounts[existing]
+		if err := codexcreds.WriteBackup(existing, accountID, blob); err != nil {
+			return store.Account{}, false, err
+		}
+		acct.LastUsed = time.Now().UTC()
+		state.Accounts[existing] = acct
+		if err := state.Save(); err != nil {
+			return store.Account{}, false, err
+		}
+		return acct, true, nil
+	}
+
+	slot := preferredSlot
+	if slot <= 0 {
+		slot = state.NextSlot()
+	} else if _, taken := state.Accounts[slot]; taken {
+		return store.Account{}, false, fmt.Errorf("slot %d already in use", slot)
+	}
+
+	if err := codexcreds.WriteBackup(slot, accountID, blob); err != nil {
+		return store.Account{}, false, err
+	}
+	if err := state.AddCodexAccount(slot, accountID); err != nil {
+		_ = codexcreds.DeleteBackup(slot, accountID)
+		return store.Account{}, false, err
+	}
+	if err := state.Save(); err != nil {
+		return store.Account{}, false, err
+	}
+	return state.Accounts[slot], false, nil
+}
+
+// MigrateToCodex reads the active Claude Code session, writes the conversation
+// to ~/.codex/memories/ as a markdown file, and returns the memory file path.
+// The caller is responsible for launching `codex` afterwards.
+func MigrateToCodex(cwd, sessionID string) (memoryFile string, err error) {
+	jsonlPath := claudeconv.SessionJSONLPath(cwd, sessionID)
+	msgs, err := claudeconv.ExtractMessages(jsonlPath)
+	if err != nil {
+		return "", fmt.Errorf("switcher: read session: %w", err)
+	}
+	if len(msgs) == 0 {
+		return "", fmt.Errorf("switcher: no messages found in session %s", sessionID)
+	}
+
+	memoriesDir := paths.CodexMemoriesDir()
+	if err := os.MkdirAll(memoriesDir, 0o700); err != nil {
+		return "", fmt.Errorf("switcher: mkdir memories: %w", err)
+	}
+
+	name := claudeconv.MemoryFileName()
+	dest := filepath.Join(memoriesDir, name)
+	content := claudeconv.FormatMemory(msgs, cwd, sessionID)
+	if err := os.WriteFile(dest, []byte(content), 0o600); err != nil {
+		return "", fmt.Errorf("switcher: write memory: %w", err)
+	}
+	return dest, nil
+}
+
+// CodexFallbackSlot returns the slot of the first registered Codex account,
+// or 0 if none are registered. Used by the wrapper for overflow switching.
+func CodexFallbackSlot() int {
+	state, err := store.Load()
+	if err != nil {
+		return 0
+	}
+	for _, a := range state.Accounts {
+		if a.IsCodex() {
+			return a.Slot
+		}
+	}
+	return 0
 }
 
 func ensureBackupRoot() error {

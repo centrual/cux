@@ -20,7 +20,7 @@ import (
 
 const stateVersion = 1
 
-// Account is one managed Claude Code account.
+// Account is one managed account (Claude Code or Codex).
 type Account struct {
 	Slot     int       `json:"slot"`
 	Email    string    `json:"email"`
@@ -28,7 +28,13 @@ type Account struct {
 	OrgUUID  string    `json:"orgUuid,omitempty"`
 	AddedAt  time.Time `json:"addedAt"`
 	LastUsed time.Time `json:"lastUsed,omitempty"`
+	// Tool identifies which CLI this account belongs to.
+	// Empty or "claude" means Claude Code; "codex" means OpenAI Codex.
+	Tool string `json:"tool,omitempty"`
 }
+
+// IsCodex reports whether this account belongs to the Codex CLI.
+func (a Account) IsCodex() bool { return a.Tool == "codex" }
 
 // CacheKey returns the usage-cache key for this account. When OrgUUID is
 // set it is used as the key so two accounts sharing the same email get
@@ -238,6 +244,47 @@ func (s *State) Add(slot int, email, uuid, orgUUID string) error {
 	}
 	s.Sequence = append(s.Sequence, slot)
 	return nil
+}
+
+// AddCodexAccount registers a Codex account. accountID is the UUID from
+// auth.json tokens.account_id. Unlike Add, it skips email-format validation
+// and uses a synthetic display email of the form "codex:<id8>".
+func (s *State) AddCodexAccount(slot int, accountID string) error {
+	if accountID == "" {
+		return fmt.Errorf("store: codex accountID must not be empty")
+	}
+	if _, exists := s.Accounts[slot]; exists {
+		return fmt.Errorf("%w: slot %d already in use", ErrAccountExists, slot)
+	}
+	// Deduplicate by UUID across codex accounts.
+	for _, a := range s.Accounts {
+		if a.IsCodex() && a.UUID == accountID {
+			return fmt.Errorf("%w: codex account %s is already slot %d", ErrAccountExists, accountID[:8], a.Slot)
+		}
+	}
+	short := accountID
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	s.Accounts[slot] = Account{
+		Slot:    slot,
+		Email:   "codex:" + short,
+		UUID:    accountID,
+		Tool:    "codex",
+		AddedAt: time.Now().UTC(),
+	}
+	s.Sequence = append(s.Sequence, slot)
+	return nil
+}
+
+// FindCodexSlot returns the slot of a codex account matching accountID, or 0.
+func (s *State) FindCodexSlot(accountID string) int {
+	for slot, a := range s.Accounts {
+		if a.IsCodex() && a.UUID == accountID {
+			return slot
+		}
+	}
+	return 0
 }
 
 // Remove unregisters an account. Caller must separately delete the
