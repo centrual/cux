@@ -313,30 +313,68 @@ func AddCodexCurrent(preferredSlot int) (added store.Account, refreshed bool, er
 }
 
 // MigrateToCodex reads the active Claude Code session, writes the conversation
-// to ~/.codex/memories/ as a markdown file, and returns the memory file path.
-// The caller is responsible for launching `codex` afterwards.
-func MigrateToCodex(cwd, sessionID string) (memoryFile string, err error) {
+// to ~/.codex/memories/ as a markdown file (for fallback context injection) and
+// also creates a native Codex session JSONL that can be resumed with
+// `codex resume <codexSessionID>`. Both paths are returned; codexSessionID is
+// empty if native session creation failed (non-fatal — memory file suffices).
+func MigrateToCodex(cwd, sessionID string) (memoryFile, codexSessionID string, err error) {
 	jsonlPath := claudeconv.SessionJSONLPath(cwd, sessionID)
 	msgs, err := claudeconv.ExtractMessages(jsonlPath)
 	if err != nil {
-		return "", fmt.Errorf("switcher: read session: %w", err)
+		return "", "", fmt.Errorf("switcher: read session: %w", err)
 	}
 	if len(msgs) == 0 {
-		return "", fmt.Errorf("switcher: no messages found in session %s", sessionID)
+		return "", "", fmt.Errorf("switcher: no messages found in session %s", sessionID)
 	}
 
 	memoriesDir := paths.CodexMemoriesDir()
 	if err := os.MkdirAll(memoriesDir, 0o700); err != nil {
-		return "", fmt.Errorf("switcher: mkdir memories: %w", err)
+		return "", "", fmt.Errorf("switcher: mkdir memories: %w", err)
 	}
 
 	name := claudeconv.MemoryFileName()
 	dest := filepath.Join(memoriesDir, name)
 	content := claudeconv.FormatMemory(msgs, cwd, sessionID)
 	if err := os.WriteFile(dest, []byte(content), 0o600); err != nil {
-		return "", fmt.Errorf("switcher: write memory: %w", err)
+		return "", "", fmt.Errorf("switcher: write memory: %w", err)
 	}
-	return dest, nil
+
+	// Also write a native Codex session — non-fatal if it fails.
+	codexID, _, nErr := claudeconv.WriteNativeCodexSession(msgs, cwd)
+	if nErr == nil {
+		codexSessionID = codexID
+	}
+
+	return dest, codexSessionID, nil
+}
+
+// MigrateFromCodex reads the given Codex session, converts it to a native
+// Claude Code session JSONL, and returns the new Claude session ID and the
+// CWD from the original Codex session. The caller should launch
+// `claude --resume <claudeSessionID>` in that CWD.
+func MigrateFromCodex(codexSessionID string) (claudeSessionID, cwd string, err error) {
+	jsonlPath, err := claudeconv.FindCodexSessionPath(codexSessionID)
+	if err != nil {
+		return "", "", fmt.Errorf("switcher: %w", err)
+	}
+
+	sourceCWD, msgs, err := claudeconv.ReadCodexSession(jsonlPath)
+	if err != nil {
+		return "", "", fmt.Errorf("switcher: read codex session: %w", err)
+	}
+	if len(msgs) == 0 {
+		return "", "", fmt.Errorf("switcher: no messages found in codex session %s", codexSessionID)
+	}
+
+	if sourceCWD == "" {
+		sourceCWD, _ = os.Getwd()
+	}
+
+	claudeID, _, err := claudeconv.WriteNativeClaudeSession(msgs, sourceCWD)
+	if err != nil {
+		return "", "", fmt.Errorf("switcher: write claude session: %w", err)
+	}
+	return claudeID, sourceCWD, nil
 }
 
 // CodexFallbackSlot returns the slot of the first registered Codex account,

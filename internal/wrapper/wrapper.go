@@ -122,15 +122,20 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			// All Claude accounts exhausted — try Codex overflow if available.
 			if codexSlot := switcher.CodexFallbackSlot(); codexSlot != 0 {
 				cwd, _ := os.Getwd()
-				if memFile, mErr := switcher.MigrateToCodex(cwd, sessionID); mErr == nil {
+				if memFile, codexID, mErr := switcher.MigrateToCodex(cwd, sessionID); mErr == nil {
 					codexBin, lErr := exec.LookPath("codex")
 					if lErr == nil {
 						fmt.Fprintf(w, "cux: all Claude accounts exhausted → migrating to Codex…\n")
 						fmt.Fprintf(w, "cux: conversation saved to %s\n", memFile)
 						claudeBin = codexBin
-						memName := filepath.Base(memFile)
-						resumeMsg := fmt.Sprintf("I've been migrated from Claude Code (all accounts rate-limited). Full conversation is in your memories as %q. Continue where we left off.", memName)
-						currentArgv = []string{resumeMsg}
+						if codexID != "" {
+							fmt.Fprintf(w, "cux: resuming native Codex session %s\n", codexID)
+							currentArgv = []string{"resume", codexID}
+						} else {
+							memName := filepath.Base(memFile)
+							resumeMsg := fmt.Sprintf("I've been migrated from Claude Code (all accounts rate-limited). Full conversation is in your memories as %q. Continue where we left off.", memName)
+							currentArgv = []string{resumeMsg}
+						}
 						continue
 					}
 				}

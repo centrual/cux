@@ -1574,7 +1574,7 @@ func printAccountTable(w io.Writer, st *store.State, liveEmail string, cache usa
 
 func cmdCodex(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: cux codex <add|list|remove|migrate>")
+		fmt.Fprintln(os.Stderr, "Usage: cux codex <add|list|remove|migrate|migrate-from|sessions>")
 		os.Exit(1)
 	}
 	sub := args[0]
@@ -1588,9 +1588,13 @@ func cmdCodex(args []string) {
 		cmdCodexRemove(rest)
 	case "migrate":
 		cmdCodexMigrate(rest)
+	case "migrate-from":
+		cmdCodexMigrateFrom(rest)
+	case "sessions":
+		cmdCodexSessions(rest)
 	default:
 		fmt.Fprintf(os.Stderr, "cux codex: unknown subcommand %q\n", sub)
-		fmt.Fprintln(os.Stderr, "Usage: cux codex <add|list|remove|migrate>")
+		fmt.Fprintln(os.Stderr, "Usage: cux codex <add|list|remove|migrate|migrate-from|sessions>")
 		os.Exit(1)
 	}
 }
@@ -1679,24 +1683,35 @@ func cmdCodexMigrate(args []string) {
 		fail(fmt.Errorf("could not detect active session — use --session <id>"))
 	}
 
-	memFile, err := switcher.MigrateToCodex(cwd, sessionID)
+	memFile, codexID, err := switcher.MigrateToCodex(cwd, sessionID)
 	if err != nil {
 		fail(err)
 	}
 	fmt.Printf("cux: migrated session %s\n", sessionID)
 	fmt.Printf("cux: conversation saved to %s\n", memFile)
+	if codexID != "" {
+		fmt.Printf("cux: native Codex session: %s\n", codexID)
+	}
 
 	codexBin, err := exec.LookPath("codex")
 	if err != nil {
 		fmt.Println("cux: Codex binary not found — install it with: npm install -g @openai/codex")
 		fmt.Printf("cux: memory file is ready at %s\n", memFile)
+		if codexID != "" {
+			fmt.Printf("cux: once installed, resume with: codex resume %s\n", codexID)
+		}
 		return
 	}
 
-	memName := filepath.Base(memFile)
-	prompt := fmt.Sprintf("I've just migrated from a Claude Code session. The full conversation history is saved in your memories as %q. Please read it to get context and continue from where we left off.", memName)
-
-	cmd := exec.Command(codexBin, prompt)
+	var cmd *exec.Cmd
+	if codexID != "" {
+		fmt.Printf("cux: resuming native Codex session %s…\n", codexID)
+		cmd = exec.Command(codexBin, "resume", codexID)
+	} else {
+		memName := filepath.Base(memFile)
+		prompt := fmt.Sprintf("I've just migrated from a Claude Code session. The full conversation history is saved in your memories as %q. Please read it to get context and continue from where we left off.", memName)
+		cmd = exec.Command(codexBin, prompt)
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1719,13 +1734,135 @@ func cmdCodexMigrateInternal(_ []string) {
 		os.Exit(1)
 	}
 
-	memFile, err := switcher.MigrateToCodex(cwd, sessionID)
+	memFile, codexID, err := switcher.MigrateToCodex(cwd, sessionID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cux: migrate failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Session migrated to Codex memory: %s\n", memFile)
-	fmt.Println("Run `codex` or `cux codex migrate` to launch Codex and continue your conversation.")
+	if codexID != "" {
+		fmt.Printf("Resume the native session with: codex resume %s\n", codexID)
+	} else {
+		fmt.Println("Run `codex` or `cux codex migrate` to launch Codex and continue your conversation.")
+	}
+}
+
+// cmdCodexMigrateFrom converts a Codex session into a native Claude Code
+// session and launches `claude --resume <id>` to continue it.
+func cmdCodexMigrateFrom(args []string) {
+	fs := flag.NewFlagSet("codex migrate-from", flag.ExitOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: cux codex migrate-from <codex-session-id>")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Converts a Codex session into a native Claude Code session and")
+		fmt.Fprintln(os.Stderr, "launches `claude --resume <id>` to continue the conversation.")
+	}
+	_ = fs.Parse(args)
+	if fs.NArg() == 0 {
+		fs.Usage()
+		os.Exit(1)
+	}
+	codexSessionID := fs.Arg(0)
+
+	claudeID, cwd, err := switcher.MigrateFromCodex(codexSessionID)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("cux: migrated Codex session %s\n", codexSessionID)
+	fmt.Printf("cux: Claude session ID: %s\n", claudeID)
+	fmt.Printf("cux: project: %s\n", cwd)
+
+	claudeBin, err := exec.LookPath("claude")
+	if err != nil {
+		fmt.Println("cux: Claude Code binary not found — install it with: npm install -g @anthropic-ai/claude-code")
+		fmt.Printf("cux: resume manually with: claude --resume %s\n", claudeID)
+		return
+	}
+
+	fmt.Printf("cux: launching claude --resume %s\n", claudeID)
+	cmd := exec.Command(claudeBin, "--resume", claudeID)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = cwd
+	if runErr := cmd.Run(); runErr != nil {
+		os.Exit(1)
+	}
+}
+
+// cmdCodexSessions lists recent Codex sessions from state_5.sqlite so the
+// user can pick a session ID for `cux codex migrate-from`.
+func cmdCodexSessions(args []string) {
+	fs := flag.NewFlagSet("codex sessions", flag.ExitOnError)
+	nFlag := fs.Int("n", 20, "max sessions to show")
+	allFlag := fs.Bool("all", false, "show sessions from all directories (default: cwd only)")
+	_ = fs.Parse(args)
+
+	home, _ := os.UserHomeDir()
+	dbPath := filepath.Join(home, ".codex", "state_5.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		fmt.Fprintln(os.Stderr, "cux: Codex state database not found — is Codex installed?")
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	var py string
+	if *allFlag {
+		py = fmt.Sprintf(`import sqlite3,json
+conn=sqlite3.connect(%q)
+rows=conn.execute("""
+SELECT id, title, cwd, datetime(updated_at,'unixepoch','localtime')
+FROM threads WHERE archived=0
+ORDER BY updated_at DESC LIMIT %d""").fetchall()
+for r in rows: print(json.dumps(list(r)))
+`, dbPath, *nFlag)
+	} else {
+		py = fmt.Sprintf(`import sqlite3,json
+conn=sqlite3.connect(%q)
+rows=conn.execute("""
+SELECT id, title, cwd, datetime(updated_at,'unixepoch','localtime')
+FROM threads WHERE archived=0 AND cwd=?
+ORDER BY updated_at DESC LIMIT %d""",(%q,)).fetchall()
+for r in rows: print(json.dumps(list(r)))
+`, dbPath, *nFlag, cwd)
+	}
+
+	out, err := exec.Command("python3", "-c", py).Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cux: failed to query Codex sessions: %v\n", err)
+		os.Exit(1)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+		if *allFlag {
+			fmt.Println("No Codex sessions found.")
+		} else {
+			fmt.Printf("No Codex sessions found for %s\n", cwd)
+			fmt.Println("Use --all to show sessions from all directories.")
+		}
+		return
+	}
+
+	// Header
+	fmt.Printf("%-36s  %-19s  %s\n", "SESSION ID", "UPDATED", "TITLE")
+	fmt.Println(strings.Repeat("-", 90))
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		var row []string
+		if jsonErr := json.Unmarshal([]byte(line), &row); jsonErr != nil || len(row) < 4 {
+			continue
+		}
+		id, title, _, updated := row[0], row[1], row[2], row[3]
+		if len(title) > 60 {
+			title = title[:57] + "..."
+		}
+		fmt.Printf("%-36s  %-19s  %s\n", id, updated, title)
+	}
+	fmt.Printf("\nTo migrate a session to Claude: cux codex migrate-from <session-id>\n")
 }
 
 // latestSessionID returns the session ID of the most recently modified JSONL
@@ -1797,11 +1934,12 @@ USAGE
   cux version                       print version
 
 CODEX INTEGRATION
-  cux codex add [--slot N]          register the currently-authenticated Codex account
-  cux codex list                    list managed Codex accounts
-  cux codex remove <slot>           forget a Codex account
-  cux codex migrate [--session ID]  export current Claude session to Codex memory
-                                    and launch Codex to continue the conversation
+  cux codex add [--slot N]              register the currently-authenticated Codex account
+  cux codex list                        list managed Codex accounts
+  cux codex remove <slot>               forget a Codex account
+  cux codex sessions [-n N] [--all]     list recent Codex sessions with their IDs
+  cux codex migrate [--session ID]      export current Claude session → Codex (native resume)
+  cux codex migrate-from <session-id>   import a Codex session → Claude (native resume)
 
 INLINE SWITCHING
   Once set up, type /switch [<slot|email>] from inside a Claude Code
