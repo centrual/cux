@@ -28,6 +28,7 @@ import (
 
 	"github.com/inulute/cux/internal/config"
 	"github.com/inulute/cux/internal/monitor"
+	"github.com/inulute/cux/internal/paths"
 	"github.com/inulute/cux/internal/signals"
 	"github.com/inulute/cux/internal/store"
 	"github.com/inulute/cux/internal/strategy"
@@ -106,49 +107,35 @@ func UserPromptSubmit(stdin io.Reader, stdout io.Writer) error {
 }
 
 func handleAutoSwitchPrompt(prompt string, stdout io.Writer) (bool, error) {
-	target, reason, ok := promptAutoSwitchTarget()
-	if !ok {
-		return false, nil
-	}
-	pid, err := wrapperPID()
-	if err != nil {
-		return false, err
-	}
-	if err := signals.Write(pid, signals.SwitchRequested, signals.SwitchRequestedPayload{
-		Target:        target,
-		ResumeMessage: prompt,
-		Timestamp:     time.Now().UTC(),
-	}); err != nil {
-		return false, err
-	}
-	writePromptBlock(stdout, "cux: "+reason+"\ncux: switching accounts and replaying your prompt after resume...")
-	return true, nil
-}
+	// Consume the replay flag written by the wrapper before relaunching.
+	// This prevents triggering another switch when the replayed prompt
+	// lands on an account that is also near threshold.
+	isReplay := consumeReplayFlag()
 
-func promptAutoSwitchTarget() (target, reason string, ok bool) {
 	cfg, err := config.Load()
 	if err != nil || !cfg.AutoSwitchOnThreshold {
-		return "", "", false
+		return false, nil
 	}
 	email, err := switcher.CurrentLiveEmail()
 	if err != nil {
-		return "", "", false
+		return false, nil
 	}
-	cache, err := usage.LoadCache()
-	if err != nil || cache == nil {
-		return "", "", false
+	cache, _ := usage.LoadCache()
+	if cache == nil {
+		cache = usage.Cache{}
 	}
-	u, ok := cache[email]
-	if !ok {
-		return "", "", false
+	u, uOK := cache[email]
+	if !uOK {
+		return false, nil
 	}
 	over, why := usage.IsOverThreshold(u, cfg.Thresholds)
 	if !over {
-		return "", "", false
+		return false, nil
 	}
+
 	state, err := store.Load()
 	if err != nil {
-		return "", "", false
+		return false, nil
 	}
 	candidates := make([]strategy.Candidate, 0, len(state.Accounts))
 	for _, a := range state.Accounts {
@@ -156,10 +143,63 @@ func promptAutoSwitchTarget() (target, reason string, ok bool) {
 	}
 	pick, picked := strategy.PickNext(cfg.ResolvedStrategy(), cfg.Strategy.Order, candidates,
 		strategy.Candidate{Email: email}, cache, cfg.Thresholds)
-	if !picked {
-		return "", "", false
+
+	if picked && !isReplay {
+		pid, err := wrapperPID()
+		if err != nil {
+			return false, err
+		}
+		if err := signals.Write(pid, signals.SwitchRequested, signals.SwitchRequestedPayload{
+			Target:        pick.Email,
+			ResumeMessage: prompt,
+			Timestamp:     time.Now().UTC(),
+		}); err != nil {
+			return false, err
+		}
+		writePromptBlock(stdout, "cux: "+why+"\ncux: switching accounts and replaying your prompt after resume...")
+		return true, nil
 	}
-	return pick.Email, why, true
+
+	// Either all accounts are at/above threshold, or this is a replayed prompt
+	// that would loop if we switched again. Show an actionable warning.
+	threshold := cfg.Thresholds.FiveHour
+	if threshold == 0 {
+		threshold = 90
+	}
+	suggested := threshold + 10
+	if suggested > 95 {
+		suggested = 95
+	}
+
+	var b strings.Builder
+	b.WriteString("cux: " + why + "\n")
+	if picked {
+		// isReplay must be true here — a target exists but switching would loop.
+		b.WriteString(fmt.Sprintf("cux: auto-switch paused to prevent a loop — manually switch with:\n  /cux:switch %s\n", pick.Email))
+	} else {
+		b.WriteString("cux: all managed accounts are at or above the usage threshold\n")
+	}
+	b.WriteString(fmt.Sprintf("cux: threshold is %d%% — raise it with:  /cux:config set thresholds.five_hour %d\n",
+		threshold, suggested))
+	if _, resetEmail, reset, ok := nextResetSlot(state, cache); ok {
+		b.WriteString(fmt.Sprintf("cux: next reset: %s in %s\n", resetEmail, reset))
+	}
+	b.WriteString("\nResend your prompt after adjusting the threshold or waiting for reset.")
+	writePromptBlock(stdout, strings.TrimRight(b.String(), "\n"))
+	return true, nil
+}
+
+func consumeReplayFlag() bool {
+	pid, err := wrapperPID()
+	if err != nil {
+		return false
+	}
+	flagFile := paths.ReplayFlagFile(pid)
+	if _, err := os.Stat(flagFile); err == nil {
+		_ = os.Remove(flagFile)
+		return true
+	}
+	return false
 }
 
 func handleCuxPromptCommand(prompt string, stdout io.Writer) (bool, error) {

@@ -82,6 +82,7 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 	// happened to have the same PID. PIDs recycle.
 	signals.CleanupForPID(pid)
 	defer signals.CleanupForPID(pid)
+	defer os.Remove(paths.ReplayFlagFile(pid))
 	if err := writeWrapperPID(pid); err != nil {
 		fmt.Fprintf(w, "cux: warning: cannot publish wrapper pid: %v\n", err)
 	}
@@ -176,6 +177,11 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			}
 			currentArgv = []string{"--resume", sessionID}
 			if p.resumeMessage != "" {
+				// Write a one-shot flag so the UserPromptSubmit hook skips the
+				// threshold check for this replayed prompt. Without this, if the
+				// new account is also at/above the threshold the hook would block
+				// the replayed prompt and trigger another switch — an infinite loop.
+				_ = os.WriteFile(paths.ReplayFlagFile(pid), []byte("1"), 0o600)
 				currentArgv = append(currentArgv, p.resumeMessage)
 			} else if cfg.AutoMessage != "" {
 				currentArgv = append(currentArgv, cfg.AutoMessage)
