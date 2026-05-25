@@ -162,15 +162,6 @@ func handleAutoSwitchPrompt(prompt string, stdout io.Writer) (bool, error) {
 
 	// Either all accounts are at/above threshold, or this is a replayed prompt
 	// that would loop if we switched again. Show an actionable warning.
-	threshold := cfg.Thresholds.FiveHour
-	if threshold == 0 {
-		threshold = 90
-	}
-	suggested := threshold + 10
-	if suggested > 95 {
-		suggested = 95
-	}
-
 	var b strings.Builder
 	b.WriteString("cux: " + why + "\n")
 	if picked {
@@ -179,8 +170,24 @@ func handleAutoSwitchPrompt(prompt string, stdout io.Writer) (bool, error) {
 	} else {
 		b.WriteString("cux: all managed accounts are at or above the usage threshold\n")
 	}
-	b.WriteString(fmt.Sprintf("cux: threshold is %d%% — raise it with:  /cux:config set thresholds.five_hour %d\n",
-		threshold, suggested))
+
+	// Only suggest raising the threshold when accounts are throttled by it
+	// (not at 100%). At 100% the threshold is irrelevant — only a reset helps.
+	trulyExhausted := (u.FiveHour != nil && u.FiveHour.Utilization >= 100) ||
+		(u.SevenDay != nil && u.SevenDay.Utilization >= 100)
+	if !trulyExhausted && !picked {
+		threshold := cfg.Thresholds.FiveHour
+		if threshold == 0 {
+			threshold = 90
+		}
+		suggested := threshold + 10
+		if suggested > 95 {
+			suggested = 95
+		}
+		b.WriteString(fmt.Sprintf("cux: threshold is %d%% — raise it with:  /cux:config set thresholds.five_hour %d\n",
+			threshold, suggested))
+	}
+
 	if _, resetEmail, reset, ok := nextResetSlot(state, cache); ok {
 		b.WriteString(fmt.Sprintf("cux: next reset: %s in %s\n", resetEmail, reset))
 	}
