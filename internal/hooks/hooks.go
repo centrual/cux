@@ -160,22 +160,23 @@ func handleAutoSwitchPrompt(prompt string, stdout io.Writer) (bool, error) {
 		return true, nil
 	}
 
-	// Either all accounts are at/above threshold, or this is a replayed prompt
-	// that would loop if we switched again. Show an actionable warning.
+	if isReplay {
+		// This is the replayed prompt after a switch. Even if the new account
+		// is also above threshold, let this one prompt through — auto-switch
+		// will engage again on the next prompt naturally.
+		return false, nil
+	}
+
+	// No usable account found. Show an actionable warning.
 	var b strings.Builder
 	b.WriteString("cux: " + why + "\n")
-	if picked {
-		// isReplay must be true here — a target exists but switching would loop.
-		b.WriteString(fmt.Sprintf("cux: auto-switch paused to prevent a loop — manually switch with:\n  /cux:switch %s\n", pick.Email))
-	} else {
-		b.WriteString("cux: all managed accounts are at or above the usage threshold\n")
-	}
+	b.WriteString("cux: all managed accounts are at or above the usage threshold\n")
 
 	// Only suggest raising the threshold when accounts are throttled by it
 	// (not at 100%). At 100% the threshold is irrelevant — only a reset helps.
 	trulyExhausted := (u.FiveHour != nil && u.FiveHour.Utilization >= 100) ||
 		(u.SevenDay != nil && u.SevenDay.Utilization >= 100)
-	if !trulyExhausted && !picked {
+	if !trulyExhausted {
 		threshold := cfg.Thresholds.FiveHour
 		if threshold == 0 {
 			threshold = 90
