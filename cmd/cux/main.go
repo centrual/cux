@@ -662,7 +662,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("thresholds.five_hour", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "2":
 			v, ok, err := promptValue(raw, reader, "7d threshold %", strconv.Itoa(c.Thresholds.SevenDay))
@@ -674,7 +674,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("thresholds.seven_day", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "3":
 			next := map[string]string{"drain": "balanced", "balanced": "manual", "manual": "drain"}[strings.ToLower(c.Strategy.Kind)]
@@ -694,7 +694,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("strategy.order", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "5":
 			if err := setAndSaveConfig("auto_switch_on_threshold", strconv.FormatBool(!c.AutoSwitchOnThreshold)); err != nil {
@@ -721,7 +721,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("auto_message", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "9":
 			if err := setAndSaveConfig("update_check.enabled", strconv.FormatBool(!c.UpdateCheck.Enabled)); err != nil {
@@ -737,7 +737,7 @@ func editConfigInteractive() error {
 			}
 			if err := setAndSaveConfig("update_check.cadence_hours", v); err != nil {
 				fmt.Printf("error: %v\r\n", err)
-				waitEnter(reader)
+				waitEnter(raw, reader)
 			}
 		case "11":
 			if err := setAndSaveConfig("notify", strconv.FormatBool(!c.Notify)); err != nil {
@@ -753,7 +753,7 @@ func editConfigInteractive() error {
 			}
 		default:
 			fmt.Print("Unknown selection.\r\n")
-			waitEnter(reader)
+			waitEnter(raw, reader)
 		}
 	}
 }
@@ -1032,9 +1032,20 @@ func readRawInput(raw *rawMenu, reader *bufio.Reader) (string, bool, error) {
 	}
 }
 
-func waitEnter(reader *bufio.Reader) {
+func waitEnter(raw *rawMenu, reader *bufio.Reader) {
 	fmt.Print("Press Enter to continue...")
-	_, _ = reader.ReadString('\n')
+	if raw == nil || !raw.enabled {
+		_, _ = reader.ReadString('\n')
+		return
+	}
+	// In raw mode Enter sends \r, not \n — ReadString('\n') would block forever.
+	for {
+		b, err := reader.ReadByte()
+		if err != nil || b == '\r' || b == '\n' || b == 0x03 || b == 0x04 {
+			fmt.Print("\r\n")
+			return
+		}
+	}
 }
 
 func checkbox(v bool) string {
