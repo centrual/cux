@@ -53,7 +53,6 @@ cux: rate limit on alice@example.com → swapped to bob@example.com, resuming…
 
 ## Contents
 
-- [Contents](#contents)
 - [Install](#install)
   - [Option 1 — npm](#option-1--npm)
   - [Option 2 — shell installer](#option-2--shell-installer)
@@ -112,7 +111,7 @@ shell scripts (e.g. native Windows PowerShell or cmd.exe).
 ### After install
 
 Run `cux setup` once. That installs the `/switch` and `/cux:*` slash
-commands plus the three Claude Code hooks. Restart Claude Code
+commands plus the four Claude Code hooks. Restart Claude Code
 afterwards so it picks them up.
 
 ### What works on which platform
@@ -150,8 +149,8 @@ installed hooks. From then on:
 
 - `/switch` from inside a Claude Code session rotates accounts.
 - `/switch <slot|email>` switches to a specific one.
-- `/cux:add`, `/cux:list`, `/cux:status`, `/cux:support`,
-  `/cux:remove`, and `/cux:switch`, `/cux:config`, `/cux:usage-refresh` run
+- `/cux:add`, `/cux:list`, `/cux:status`, `/cux:config`, `/cux:remove`,
+  `/cux:switch`, `/cux:usage-refresh`, and `/cux:support` run
   account-management commands in-session.
 - A rate-limit response from the API auto-triggers the same flow and
   does not wait for another Stop hook before reconnecting.
@@ -163,7 +162,7 @@ A 30-second check that proves end-to-end context preservation:
 1. Send: *"Please remember the number 4729."*
 2. Wait for the reply.
 3. Send `/switch`.
-4. After the ~2-second reconnect, ask: *"What number did I tell you?"*
+4. After the ~2-second reconnect, ask: *"What number did I tell you to remember?"*
 
 If the answer is `4729`, swap-and-resume is working.
 
