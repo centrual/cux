@@ -133,6 +133,24 @@ func handleAutoSwitchPrompt(prompt string, stdout io.Writer) (bool, error) {
 		return false, nil
 	}
 
+	// Refresh all accounts before picking a target. The cache may be stale
+	// (e.g. a candidate's 5h window has reset since the last poll) and we
+	// must not switch to an account that looks exhausted only because the
+	// cache hasn't caught up yet. The hook timeout is 20 s so a refresh
+	// here is safe.
+	if fresh, _ := monitor.RefreshAll(); fresh != nil {
+		cache = fresh
+		// Re-read the current account from the fresh cache.
+		if freshU, ok := fresh[email]; ok {
+			u = freshU
+			// If the current account itself has recovered (e.g. its 5h window
+			// just reset), don't switch — let the prompt through.
+			if newOver, _ := usage.IsOverThreshold(u, cfg.Thresholds); !newOver {
+				return false, nil
+			}
+		}
+	}
+
 	state, err := store.Load()
 	if err != nil {
 		return false, nil

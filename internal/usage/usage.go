@@ -176,9 +176,23 @@ func SaveCache(c Cache) error {
 // it into the swap history.
 //
 // A threshold of 100 means "reactive only" — never trigger preemptively
-// on that window. We treat a missing window (nil pointer) as "no
-// data, no decision" — never as "definitely under threshold."
+// on that window. However, when utilization is genuinely at the hard limit
+// (100%), the account is blocked regardless of threshold preference, so we
+// always return true. This ensures the session-limit case (where Claude Code
+// blocks at the UI layer before any tool use, so PostToolUseFailure never
+// fires) is still caught by the prompt-submit and stop-signal paths.
+//
+// We treat a missing window (nil pointer) as "no data, no decision" — never
+// as "definitely under threshold."
 func IsOverThreshold(u AccountUsage, t Thresholds) (over bool, reason string) {
+	// Hard-limit check: genuinely exhausted accounts must always trigger a
+	// switch regardless of the configured threshold.
+	if u.FiveHour != nil && u.FiveHour.Utilization >= 100 {
+		return true, "5h utilization at hard limit (100%)"
+	}
+	if u.SevenDay != nil && u.SevenDay.Utilization >= 100 {
+		return true, "7d utilization at hard limit (100%)"
+	}
 	if t.SevenDay > 0 && t.SevenDay < 100 && u.SevenDay != nil {
 		if u.SevenDay.Utilization >= float64(t.SevenDay) {
 			return true, fmt.Sprintf("7d utilization %.0f%% ≥ threshold %d%%",

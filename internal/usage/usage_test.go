@@ -58,6 +58,26 @@ func TestIsOverThreshold(t *testing.T) {
 			wantOver: false,
 		},
 		{
+			name: "threshold=100 but 5h at hard limit — must trigger",
+			u: AccountUsage{
+				FiveHour: ptr(Window{Utilization: 100}),
+				SevenDay: ptr(Window{Utilization: 31}),
+			},
+			t:        Thresholds{FiveHour: 100, SevenDay: 100},
+			wantOver: true,
+			wantSub:  "hard limit",
+		},
+		{
+			name: "threshold=100 but 7d at hard limit — must trigger",
+			u: AccountUsage{
+				FiveHour: ptr(Window{Utilization: 0}),
+				SevenDay: ptr(Window{Utilization: 100}),
+			},
+			t:        Thresholds{FiveHour: 100, SevenDay: 100},
+			wantOver: true,
+			wantSub:  "hard limit",
+		},
+		{
 			name: "missing window is not 'safe'; we just don't decide on it",
 			u: AccountUsage{
 				FiveHour: ptr(Window{Utilization: 92}),
