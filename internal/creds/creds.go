@@ -25,6 +25,8 @@
 package creds
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +37,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/zalando/go-keyring"
@@ -92,8 +95,11 @@ func WriteLive(blob string) error {
 // ReadBackup returns the saved credential blob for one account, or
 // ErrNotFound if there is no backup for it.
 func ReadBackup(slot int, email string) (string, error) {
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		return readBackupFile(slot, email)
+	case "darwin":
+		return readBackupKeychainMacOS(slot, email)
 	}
 	return readBackupKeyring(slot, email)
 }
@@ -103,8 +109,11 @@ func WriteBackup(slot int, email, blob string) error {
 	if blob == "" {
 		return errors.New("creds: refusing to write empty backup credentials")
 	}
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		return writeBackupFile(slot, email, blob)
+	case "darwin":
+		return writeBackupKeychainMacOS(slot, email, blob)
 	}
 	return writeBackupKeyring(slot, email, blob)
 }
@@ -248,8 +257,11 @@ func RefreshBlob(blob string) (string, error) {
 // DeleteBackup removes the saved credential blob for one account.
 // Missing entries are not an error — deletion is idempotent.
 func DeleteBackup(slot int, email string) error {
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		return deleteBackupFile(slot, email)
+	case "darwin":
+		return deleteBackupKeychainMacOS(slot, email)
 	}
 	return deleteBackupKeyring(slot, email)
 }
@@ -310,7 +322,7 @@ func writeLiveFile(blob string) error {
 	return atomicfile.Write(paths.ClaudeCredentials(), []byte(blob), 0o600)
 }
 
-// --- Backup: keyring (macOS/Windows) --------------------------------------
+// --- Backup: keyring (Windows) --------------------------------------------
 
 func backupKeyringUser(slot int, email string) string {
 	// Mirror cc-account-switcher / claude-swap convention so the data
@@ -343,6 +355,93 @@ func deleteBackupKeyring(slot int, email string) error {
 		return fmt.Errorf("creds: keyring delete: %w", err)
 	}
 	return nil
+}
+
+// --- Backup: Keychain via security CLI (macOS) -----------------------------
+
+// go-keyring rejects secrets over ~3 KB on macOS: it pipes the whole
+// add-generic-password command through `security -i` and errors once the
+// command line exceeds 4096 bytes ("data passed to Set was too big").
+// Claude Code stores every MCP server's OAuth state next to the account
+// login in the same credential blob, so real-world blobs routinely blow
+// past that cap and `cux add` fails. Shelling out to `security` with the
+// secret as an argument — exactly what the live path above already does —
+// has no such limit.
+//
+// The stored value keeps go-keyring's well-known-prefix base64 encoding,
+// so backups written by earlier cux versions read back fine and vice
+// versa.
+
+// Prefixes go-keyring puts in front of encoded secrets.
+const (
+	keyringBase64Prefix = "go-keyring-base64:"
+	keyringHexPrefix    = "go-keyring-encoded:"
+)
+
+func readBackupKeychainMacOS(slot int, email string) (string, error) {
+	cmd := exec.Command("security", "find-generic-password",
+		"-s", backupKeyringService,
+		"-wa", backupKeyringUser(slot, email))
+	out, err := cmd.Output()
+	if err != nil {
+		// `security` returns exit 44 when the item isn't found.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("creds: security find backup: %w", err)
+	}
+	return decodeBackupValue(trimTrailingNewline(string(out)))
+}
+
+func writeBackupKeychainMacOS(slot int, email, blob string) error {
+	// base64 keeps the value single-line ASCII so `security` round-trips
+	// it verbatim instead of hex-mangling multiline/non-ASCII input.
+	encoded := keyringBase64Prefix + base64.StdEncoding.EncodeToString([]byte(blob))
+	cmd := exec.Command("security", "add-generic-password",
+		"-U", // update if already present
+		"-s", backupKeyringService,
+		"-a", backupKeyringUser(slot, email),
+		"-w", encoded,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("creds: security add backup: %w (%s)", err, out)
+	}
+	return nil
+}
+
+func deleteBackupKeychainMacOS(slot int, email string) error {
+	cmd := exec.Command("security", "delete-generic-password",
+		"-s", backupKeyringService,
+		"-a", backupKeyringUser(slot, email))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if strings.Contains(string(out), "could not be found") {
+			return nil // deletion is idempotent
+		}
+		return fmt.Errorf("creds: security delete backup: %w (%s)", err, out)
+	}
+	return nil
+}
+
+// decodeBackupValue undoes go-keyring's optional secret encoding so
+// backups written through go-keyring (older cux versions, or the Windows
+// path) read back as the original blob.
+func decodeBackupValue(v string) (string, error) {
+	switch {
+	case strings.HasPrefix(v, keyringBase64Prefix):
+		dec, err := base64.StdEncoding.DecodeString(v[len(keyringBase64Prefix):])
+		if err != nil {
+			return "", fmt.Errorf("creds: decode backup: %w", err)
+		}
+		return string(dec), nil
+	case strings.HasPrefix(v, keyringHexPrefix):
+		dec, err := hex.DecodeString(v[len(keyringHexPrefix):])
+		if err != nil {
+			return "", fmt.Errorf("creds: decode backup: %w", err)
+		}
+		return string(dec), nil
+	}
+	return v, nil
 }
 
 // --- Backup: file (Linux) -------------------------------------------------
