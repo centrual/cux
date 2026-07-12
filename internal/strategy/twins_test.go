@@ -69,3 +69,48 @@ func TestIdentifierFallsBackToEmail(t *testing.T) {
 		t.Errorf("Identifier() = %q, want email fallback for slotless picks", p.Identifier())
 	}
 }
+
+// A mixed pool: a personal subscription (no org, so its seat key falls
+// back to the email) next to org seats. Every plan type must interop.
+func TestPickNextMixedPersonalAndOrgSeats(t *testing.T) {
+	personal := Candidate{Email: "me@x.test", Slot: 1, CacheKey: "me@x.test"} // Account.CacheKey() email fallback
+	orgSeat := Candidate{Email: "me@x.test", Slot: 2, CacheKey: "u-me|org-corp"}
+	th := usage.Thresholds{FiveHour: 100, SevenDay: 100}
+
+	cache := usage.Cache{
+		"me@x.test":     {FiveHour: &usage.Window{Utilization: 100}, SevenDay: &usage.Window{Utilization: 50}},
+		"u-me|org-corp": {FiveHour: &usage.Window{Utilization: 10}, SevenDay: &usage.Window{Utilization: 20}},
+	}
+
+	// Personal seat exhausted → must rotate onto the org seat even
+	// though the seat keys use different shapes (email vs uuid|org).
+	pick, ok := PickNext(KindDrain, nil, []Candidate{personal, orgSeat}, personal, cache, th)
+	if !ok || pick.Slot != 2 {
+		t.Errorf("got (slot %d, %v), want the org seat (slot 2, true)", pick.Slot, ok)
+	}
+
+	// And the reverse: org seat exhausted → personal picks up.
+	cache["me@x.test"] = usage.AccountUsage{FiveHour: &usage.Window{Utilization: 10}, SevenDay: &usage.Window{Utilization: 20}}
+	cache["u-me|org-corp"] = usage.AccountUsage{FiveHour: &usage.Window{Utilization: 100}, SevenDay: &usage.Window{Utilization: 50}}
+	pick, ok = PickNext(KindDrain, nil, []Candidate{personal, orgSeat}, orgSeat, cache, th)
+	if !ok || pick.Slot != 1 {
+		t.Errorf("got (slot %d, %v), want the personal seat (slot 1, true)", pick.Slot, ok)
+	}
+}
+
+// Windows the API omits for a plan (e.g. no weekly cap) must read as
+// capacity, not as exhaustion — pointers stay nil and every check
+// treats nil as room.
+func TestPickNextToleratesMissingWindows(t *testing.T) {
+	a := Candidate{Email: "a@x.test", Slot: 1, CacheKey: "u-a|org"}
+	b := Candidate{Email: "b@x.test", Slot: 2, CacheKey: "u-b|org"}
+	th := usage.Thresholds{FiveHour: 100, SevenDay: 100}
+	cache := usage.Cache{
+		"u-a|org": {FiveHour: &usage.Window{Utilization: 100}}, // no 7d window at all
+		"u-b|org": {FiveHour: &usage.Window{Utilization: 5}},   // no 7d window at all
+	}
+	pick, ok := PickNext(KindDrain, nil, []Candidate{a, b}, a, cache, th)
+	if !ok || pick.Slot != 2 {
+		t.Errorf("got (slot %d, %v), want slot 2 despite missing 7d windows", pick.Slot, ok)
+	}
+}
