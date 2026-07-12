@@ -194,56 +194,72 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			return exitCode, nil
 		}
 
-		target, err := resolveTarget(p.explicitTarget, p.trigger, &cfg)
-		if err != nil {
-			if p.trigger == history.TriggerRateLimit || p.trigger == history.TriggerThreshold {
-				_, _ = monitor.RefreshAll()
-				target, err = resolveTarget(p.explicitTarget, p.trigger, &cfg)
+		// Concurrent sessions all see the same rate limit at once: the
+		// first wrapper through the lock swaps, and without this check
+		// every other one would land on the freshly-switched, healthy
+		// account and still swap again — one pointless hop per session,
+		// burning through the whole pool. Refresh first so the verdict
+		// uses current data, then skip the swap when the live account
+		// already has room. Manual switches are never skipped.
+		swapped := true
+		var from, to store.Account
+		if p.explicitTarget == "" &&
+			(p.trigger == history.TriggerRateLimit || p.trigger == history.TriggerThreshold) {
+			_, _ = monitor.RefreshAll()
+			if acct, ok := liveAccountWithCapacity(&cfg); ok {
+				fmt.Fprintf(w, "cux: %s already has capacity (another session may have swapped) — resuming without switching\n", acct.Email)
+				from, to = acct, acct
+				swapped = false
 			}
 		}
-		if err != nil && cfg.WaitForReset && p.explicitTarget == "" &&
-			(p.trigger == history.TriggerRateLimit || p.trigger == history.TriggerThreshold) {
-			target, err = waitForReset(p.trigger, &cfg, w)
-		}
-		if err != nil {
-			fmt.Fprintf(w, "cux: %v — staying on current account\n", err)
-			return exitCode, nil
-		}
 
-		from, to, swapErr := switcher.SwitchTo(target)
-		if swapErr != nil {
-			fmt.Fprintf(w, "cux: switch failed: %v\n", swapErr)
-			return 1, swapErr
-		}
-
-		// Append swap to the history log. Best-effort — a failure
-		// here doesn't unwind the swap.
 		cwd, _ := os.Getwd()
-		toUsageCache, _ := usage.LoadCache()
-		toUsage := toUsageCache[to.Email]
-		entry := history.Entry{
-			From:        from.Email,
-			To:          to.Email,
-			Trigger:     p.trigger,
-			Reason:      p.reason,
-			SessionID:   sessionID,
-			CWD:         cwd,
-			FromUsage5h: utilizationOrZero(p.fromUsage.FiveHour),
-			FromUsage7d: utilizationOrZero(p.fromUsage.SevenDay),
-			ToUsage5h:   utilizationOrZero(toUsage.FiveHour),
-			ToUsage7d:   utilizationOrZero(toUsage.SevenDay),
-		}
-		_ = history.Append(entry)
+		if swapped {
+			target, err := resolveTarget(p.explicitTarget, p.trigger, &cfg)
+			if err != nil && cfg.WaitForReset && p.explicitTarget == "" &&
+				(p.trigger == history.TriggerRateLimit || p.trigger == history.TriggerThreshold) {
+				target, err = waitForReset(p.trigger, &cfg, w)
+			}
+			if err != nil {
+				fmt.Fprintf(w, "cux: %v — staying on current account\n", err)
+				return exitCode, nil
+			}
 
-		// Refresh both accounts' caches. The "from" entry now
-		// represents the freshest reading we have; the "to" entry
-		// will be updated again at the first Stop on the new
-		// session, but doing it here gives `cux list` correct data
-		// immediately.
-		go func(from, to string) {
-			_ = monitor.RefreshActive(from)
-			_ = monitor.RefreshActive(to)
-		}(from.Email, to.Email)
+			var swapErr error
+			from, to, swapErr = switcher.SwitchTo(target)
+			if swapErr != nil {
+				fmt.Fprintf(w, "cux: switch failed: %v\n", swapErr)
+				return 1, swapErr
+			}
+
+			// Append swap to the history log. Best-effort — a failure
+			// here doesn't unwind the swap.
+			toUsageCache, _ := usage.LoadCache()
+			toUsage := toUsageCache[to.Email]
+			entry := history.Entry{
+				From:        from.Email,
+				To:          to.Email,
+				Trigger:     p.trigger,
+				Reason:      p.reason,
+				SessionID:   sessionID,
+				CWD:         cwd,
+				FromUsage5h: utilizationOrZero(p.fromUsage.FiveHour),
+				FromUsage7d: utilizationOrZero(p.fromUsage.SevenDay),
+				ToUsage5h:   utilizationOrZero(toUsage.FiveHour),
+				ToUsage7d:   utilizationOrZero(toUsage.SevenDay),
+			}
+			_ = history.Append(entry)
+
+			// Refresh both accounts' caches. The "from" entry now
+			// represents the freshest reading we have; the "to" entry
+			// will be updated again at the first Stop on the new
+			// session, but doing it here gives `cux list` correct data
+			// immediately.
+			go func(from, to string) {
+				_ = monitor.RefreshActive(from)
+				_ = monitor.RefreshActive(to)
+			}(from.Email, to.Email)
+		}
 
 		// Update the manual-switch guard. A deliberate /switch sets the
 		// guard; a rate-limit or threshold swap clears it (necessity wins).
@@ -260,10 +276,12 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 			// Only resume if at least one turn completed — an empty/just-started
 			// session has no transcript content and claude rejects --resume for it.
 			// This applies to all trigger types including manual /switch.
-			switch p.trigger {
-			case history.TriggerRateLimit:
+			switch {
+			case !swapped:
+				fmt.Fprintf(w, "cux: resuming on %s…\n", to.Email)
+			case p.trigger == history.TriggerRateLimit:
 				fmt.Fprintf(w, "cux: rate limit on %s → swapped to %s, resuming…\n", from.Email, to.Email)
-			case history.TriggerManual:
+			case p.trigger == history.TriggerManual:
 				fmt.Fprintf(w, "cux: %s → %s, resuming…\n", from.Email, to.Email)
 			default:
 				fmt.Fprintf(w, "cux: %s → %s (%s), resuming…\n", from.Email, to.Email, p.reason)
@@ -284,7 +302,11 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 		} else {
 			// No session to resume — Claude will start fresh (welcome screen).
 			// Print the switch result so the user knows which account is now active.
-			fmt.Fprintf(w, "cux: switched to %s — now active\n", to.Email)
+			if swapped {
+				fmt.Fprintf(w, "cux: switched to %s — now active\n", to.Email)
+			} else {
+				fmt.Fprintf(w, "cux: continuing on %s\n", to.Email)
+			}
 			currentArgv = argv
 		}
 	}
@@ -721,6 +743,9 @@ func isActiveHardLimited() bool {
 // even the fallback path never spins.
 const (
 	waitForResetAttempts = 4
+	// waitPollInterval is how often a sleeping waitForReset re-reads
+	// the shared cache for capacity another session may have created.
+	waitPollInterval = time.Minute
 	// resetSlack pads each sleep so we wake after the API-side window
 	// has actually rolled over, not in the same second it should.
 	resetSlack = 90 * time.Second
@@ -743,13 +768,66 @@ func waitForReset(trigger history.Trigger, cfg *config.Config, w io.Writer) (str
 		}
 		fmt.Fprintf(w, "cux: all accounts exhausted — waiting %s for %s to reset…\n",
 			shortDuration(d), email)
-		time.Sleep(d)
+		// Sleep in slices instead of one block: a concurrent session may
+		// swap or refresh the shared cache while we wait, in which case
+		// capacity is available long before the computed reset. The
+		// probes only read local files — with no other session writing,
+		// they never fire and this degrades to the single plain sleep.
+		for d > 0 {
+			chunk := min(d, waitPollInterval)
+			time.Sleep(chunk)
+			d -= chunk
+			if acct, ok := liveAccountWithCapacity(cfg); ok {
+				fmt.Fprintf(w, "cux: %s regained capacity while waiting — resuming early\n", acct.Email)
+				return acct.Email, nil
+			}
+			if target, err := resolveTarget("", trigger, cfg); err == nil {
+				fmt.Fprintf(w, "cux: capacity appeared on %s while waiting — resuming early\n", target)
+				return target, nil
+			}
+		}
 		_, _ = monitor.RefreshAll()
 		if target, err := resolveTarget("", trigger, cfg); err == nil {
 			return target, nil
 		}
 	}
 	return "", errors.New("accounts still exhausted after waiting for resets")
+}
+
+// liveAccountWithCapacity returns the managed account currently
+// holding the live credentials, when it still has switch capacity
+// under the configured thresholds. ok is false when the live account
+// is unmanaged, has no usage data yet, or is out of room — callers
+// then proceed with a normal swap.
+func liveAccountWithCapacity(cfg *config.Config) (store.Account, bool) {
+	email, err := switcher.CurrentLiveEmail()
+	if err != nil || email == "" {
+		return store.Account{}, false
+	}
+	state, err := store.Load()
+	if err != nil {
+		return store.Account{}, false
+	}
+	slot := state.FindByEmail(email)
+	if slot == 0 {
+		return store.Account{}, false
+	}
+	acct := state.Accounts[slot]
+	cache, _ := usage.LoadCache()
+	u, ok := cachedUsage(cache, acct.CacheKey(), acct.Email)
+	if !ok || u.TokenExpired {
+		return store.Account{}, false
+	}
+	// accountHasSwitchCapacity looks the entry up by one key only;
+	// hand it whichever key actually holds the data.
+	key := acct.CacheKey()
+	if _, exists := cache[key]; !exists {
+		key = acct.Email
+	}
+	if !accountHasSwitchCapacity(cache, key, cfg) {
+		return store.Account{}, false
+	}
+	return acct, true
 }
 
 // nextAvailability returns the earliest instant any account becomes
