@@ -808,11 +808,27 @@ func liveAccountWithCapacity(cfg *config.Config) (store.Account, bool) {
 	if err != nil {
 		return store.Account{}, false
 	}
-	slot := state.FindByEmail(email)
-	if slot == 0 {
-		return store.Account{}, false
+	// Find the seat holding the live credentials by cache key first —
+	// emails are not unique (the same address can hold a personal
+	// subscription and one seat per org); email is the legacy fallback.
+	liveKey, _ := switcher.CurrentLiveCacheKey()
+	var acct store.Account
+	found := false
+	if liveKey != "" && liveKey != email {
+		for _, a := range state.Accounts {
+			if a.CacheKey() == liveKey {
+				acct, found = a, true
+				break
+			}
+		}
 	}
-	acct := state.Accounts[slot]
+	if !found {
+		slot := state.FindByEmail(email)
+		if slot == 0 {
+			return store.Account{}, false
+		}
+		acct = state.Accounts[slot]
+	}
 	cache, _ := usage.LoadCache()
 	u, ok := cachedUsage(cache, acct.CacheKey(), acct.Email)
 	if !ok || u.TokenExpired {
