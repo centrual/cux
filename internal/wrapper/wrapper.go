@@ -935,6 +935,13 @@ func gracefulExit(cmd *exec.Cmd, w io.Writer) {
 	if cmd.Process == nil {
 		return
 	}
+	// Snapshot the descendant tree before signalling: claudeBin may be
+	// a wrapper script chaining other tools (cux → headroom → claude,
+	// issue #3). The SIGINT below reaches only the direct child, and a
+	// dying shell does not forward it — grandchildren would survive,
+	// stay attached to the terminal, and fight the relaunched claude
+	// for stdin.
+	strays := descendantPIDs(cmd.Process.Pid)
 	_ = cmd.Process.Signal(os.Interrupt)
 
 	deadline := time.NewTimer(gracefulExitWait)
@@ -947,9 +954,11 @@ func gracefulExit(cmd *exec.Cmd, w io.Writer) {
 		case <-deadline.C:
 			fmt.Fprintln(w, "cux: claude did not exit cleanly, terminating…")
 			_ = cmd.Process.Kill()
+			reapStrays(strays, w)
 			return
 		case <-tick.C:
 			if cmd.ProcessState != nil {
+				reapStrays(strays, w)
 				return
 			}
 		}
