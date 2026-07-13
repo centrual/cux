@@ -19,6 +19,7 @@
 package wrapper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -37,12 +38,14 @@ import (
 	"github.com/inulute/cux/internal/history"
 	"github.com/inulute/cux/internal/monitor"
 	"github.com/inulute/cux/internal/paths"
+	"github.com/inulute/cux/internal/ptyhost"
 	"github.com/inulute/cux/internal/registry"
 	"github.com/inulute/cux/internal/signals"
 	"github.com/inulute/cux/internal/store"
 	"github.com/inulute/cux/internal/strategy"
 	"github.com/inulute/cux/internal/switcher"
 	"github.com/inulute/cux/internal/usage"
+	"golang.org/x/term"
 )
 
 const (
@@ -57,6 +60,18 @@ const (
 	transcriptPollInterval = 50 * time.Millisecond
 	resumeRetryExtraWait   = 500 * time.Millisecond
 )
+
+// crlfWriter translates \n to \r\n so wrapper narration renders
+// correctly while the terminal is in raw mode for the PTY host.
+type crlfWriter struct{ w io.Writer }
+
+func (c crlfWriter) Write(p []byte) (int, error) {
+	out := bytes.ReplaceAll(p, []byte("\n"), []byte("\r\n"))
+	if _, err := c.w.Write(out); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
 
 // pending captures the reason the wrapper has decided a swap is needed.
 // trigger is the user-facing label that ends up in the swap history;
@@ -99,6 +114,30 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 	// can show every concurrent session at a glance.
 	registry.UpdateSelf(func(e *registry.Entry) { e.State = registry.StateRunning })
 	defer registry.RemoveSelf()
+
+	// Attachable sessions: when stdin is a real terminal, run claude on
+	// a wrapper-owned PTY and serve mirrors on a Unix socket. The PTY
+	// outlives individual claude launches, so attached viewers ride
+	// straight through account swaps. Non-TTY stdin (pipes, CI) keeps
+	// the plain inherit-stdio path untouched.
+	var host *ptyhost.Host
+	if cfg.Attach && term.IsTerminal(int(os.Stdin.Fd())) {
+		_ = os.MkdirAll(paths.AttachDir(), 0o700)
+		if h, err := ptyhost.New(paths.AttachSock(pid), cfg.AttachInput); err == nil {
+			host = h
+			defer host.Close()
+			if old, rawErr := term.MakeRaw(int(os.Stdin.Fd())); rawErr == nil {
+				defer func() { _ = term.Restore(int(os.Stdin.Fd()), old) }()
+			}
+			go host.Pump()
+			// Wrapper narration ("cux: …" lines) goes to the real
+			// terminal (raw mode needs CRLF) and to attached viewers.
+			w = io.MultiWriter(crlfWriter{os.Stdout}, host.BroadcastWriter())
+			registry.UpdateSelf(func(e *registry.Entry) { e.Attachable = true })
+		} else {
+			fmt.Fprintf(w, "cux: attach disabled: %v\n", err)
+		}
+	}
 
 	// lastManualTarget holds the email the user explicitly switched to
 	// within this wrapper session. Threshold auto-switch is suppressed
@@ -146,7 +185,7 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 				e.Detail = ""
 			})
 		}
-		exitCode, sessionID, hadTurns, p, err := launch(claudeBin, currentArgv, pid, &cfg, lastManualTarget, w)
+		exitCode, sessionID, hadTurns, p, err := launch(claudeBin, currentArgv, pid, &cfg, lastManualTarget, host, w)
 		if err != nil {
 			return exitCode, err
 		}
@@ -356,11 +395,17 @@ func setManualSwitchState(email string) {
 // Returns the child's exit code, the session_id we observed (if any),
 // whether at least one turn completed (Stop signal fired), and a non-nil
 // pending struct if the wrapper has decided to swap.
-func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config, manualTarget string, w io.Writer) (int, string, bool, *pending, error) {
+func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config, manualTarget string, host *ptyhost.Host, w io.Writer) (int, string, bool, *pending, error) {
 	cmd := exec.Command(claudeBin, argv...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if host != nil {
+		tty := host.TTY()
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
+		cmd.SysProcAttr = ptyhost.SysProcAttr()
+	} else {
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
 	cmd.Env = append(os.Environ(),
 		envWrapped+"=1",
 		envWrapperPID+"="+strconv.Itoa(wrapperPID),

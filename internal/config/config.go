@@ -71,6 +71,11 @@ type Config struct {
 	PollIntervalSeconds   int               `json:"poll_interval_seconds"`
 	UpdateCheck           UpdateCheckConfig `json:"update_check"`
 	Theme                 string            `json:"theme"`
+	// Attach exposes each session on a local Unix socket so `cux attach`
+	// (and tools like cuxdeck) can mirror the terminal; AttachInput
+	// additionally lets attached clients type into the session.
+	Attach      bool `json:"attach"`
+	AttachInput bool `json:"attach_input"`
 }
 
 // ResolvedStrategy returns the parsed strategy.Kind.
@@ -95,6 +100,8 @@ func Defaults() Config {
 		PollIntervalSeconds:   60,
 		UpdateCheck:           UpdateCheckConfig{Enabled: true, CadenceHours: 6},
 		Theme:                 "claude",
+		Attach:                true,
+		AttachInput:           true,
 	}
 }
 

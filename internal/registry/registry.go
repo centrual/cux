@@ -35,14 +35,15 @@ const (
 
 // Entry is one running wrapper's self-reported status.
 type Entry struct {
-	PID       int       `json:"pid"`
-	CWD       string    `json:"cwd"`
-	SessionID string    `json:"sessionId,omitempty"`
-	Seat      string    `json:"seat,omitempty"` // email claude was last launched on
-	State     string    `json:"state"`
-	Detail    string    `json:"detail,omitempty"` // human hint: "reset in 1h23m", "attempt 3"
-	StartedAt time.Time `json:"startedAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	PID        int       `json:"pid"`
+	CWD        string    `json:"cwd"`
+	SessionID  string    `json:"sessionId,omitempty"`
+	Seat       string    `json:"seat,omitempty"` // email claude was last launched on
+	State      string    `json:"state"`
+	Attachable bool      `json:"attachable,omitempty"` // wrapper serves an attach socket
+	Detail     string    `json:"detail,omitempty"`     // human hint: "reset in 1h23m", "attempt 3"
+	StartedAt  time.Time `json:"startedAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 func dir() string { return filepath.Join(paths.RuntimeDir(), "sessions") }

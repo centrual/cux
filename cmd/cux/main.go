@@ -74,6 +74,7 @@ var knownSubcommands = map[string]bool{
 	"rm":              true,
 	"status":          true,
 	"sessions":        true,
+	"attach":          true,
 	"support":         true,
 	"switch":          true,
 	"force-switch":    true,
@@ -125,6 +126,8 @@ func main() {
 		cmdProject(rest)
 	case "status":
 		cmdStatus(rest)
+	case "attach":
+		os.Exit(cmdAttach(rest))
 	case "sessions":
 		cmdSessions(rest)
 	case "support":

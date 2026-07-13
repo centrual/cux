@@ -9,6 +9,7 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -105,8 +106,13 @@ func StateFile() string     { return filepath.Join(BackupRoot(), "state.json") }
 func AccountsDir() string   { return filepath.Join(BackupRoot(), "accounts") }
 func RuntimeDir() string    { return filepath.Join(BackupRoot(), "runtime") }
 func ClaudePIDFile() string { return filepath.Join(RuntimeDir(), "claude.pid") }
-func PendingFile() string   { return filepath.Join(RuntimeDir(), "pending.json") }
-func LockFile() string      { return filepath.Join(BackupRoot(), ".lock") }
+
+// AttachDir holds per-wrapper attach sockets for `cux attach` and
+// remote bridges; AttachSock names one wrapper's socket.
+func AttachDir() string         { return filepath.Join(RuntimeDir(), "attach") }
+func AttachSock(pid int) string { return filepath.Join(AttachDir(), fmt.Sprintf("%d.sock", pid)) }
+func PendingFile() string       { return filepath.Join(RuntimeDir(), "pending.json") }
+func LockFile() string          { return filepath.Join(BackupRoot(), ".lock") }
 
 // ReplayFlagFile is a one-shot file written by the wrapper before it relaunches
 // Claude with a replayed prompt. The UserPromptSubmit hook reads and deletes it
