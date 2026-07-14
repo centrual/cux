@@ -1,33 +1,418 @@
 //go:build windows
 
-// Attachable sessions require a Unix PTY; on Windows the wrapper falls
-// back to plain stdio inheritance (ConPTY support can follow).
+// Windows attach host, built on ConPTY (the Windows pseudo-console).
+// Mirrors the Unix host's contract — New/Pump/BroadcastWriter/Close plus
+// the socket + frame protocol from frame.go — so cux attach and cuxdeck
+// treat both platforms identically. The one shape difference is process
+// launch: os/exec can't attach a ConPTY, so StartAttached spawns claude
+// with CreateProcess + a PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE attribute
+// and returns a `child` the wrapper drives like any other.
 package ptyhost
 
 import (
 	"errors"
 	"io"
+	"net"
 	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-var ErrUnsupported = errors.New("ptyhost: not supported on windows")
+// ErrUnsupported is retained for callers that referenced it; ConPTY is
+// now implemented, so New no longer returns it.
+var ErrUnsupported = errors.New("ptyhost: not supported")
 
-const (
-	FrameOut byte = iota
-	FrameInput
-	FrameResize
-	FramePing
-)
+const procThreadAttributePseudoConsole = 0x00020016
 
-type Host struct{}
+type winsize struct{ rows, cols uint16 }
 
-func New(sockPath string, inputOK bool) (*Host, error)       { return nil, ErrUnsupported }
-func (h *Host) TTY() *os.File                                { return nil }
-func (h *Host) TTYDup() (*os.File, error)                    { return nil, ErrUnsupported }
-func (h *Host) Pump()                                        {}
-func (h *Host) BroadcastWriter() io.Writer                   { return io.Discard }
-func (h *Host) Close()                                       {}
-func SysProcAttr() *syscall.SysProcAttr                      { return nil }
-func WriteFrame(w io.Writer, typ byte, payload []byte) error { return ErrUnsupported }
-func ReadFrame(r io.Reader) (byte, []byte, error)            { return 0, nil, ErrUnsupported }
+type clientState struct{ size winsize }
+
+// Host owns the ConPTY and the attach socket for one wrapper.
+type Host struct {
+	hpc  windows.Handle // pseudo console
+	inW  *os.File       // write end → ConPTY input (host writes keystrokes)
+	outR *os.File       // read end ← ConPTY output (host reads screen)
+
+	ln       net.Listener
+	sockPath string
+	inputOK  bool
+
+	mu      sync.Mutex
+	clients map[net.Conn]*clientState
+	local   winsize
+	closed  bool
+}
+
+// New creates the ConPTY (sized to the current console), keeps the host
+// ends of its pipes, and serves attach clients on sockPath.
+func New(sockPath string, inputOK bool) (*Host, error) {
+	// Two pipes: input (host → console) and output (console → host).
+	var inR, inW, outR, outW windows.Handle
+	if err := windows.CreatePipe(&inR, &inW, nil, 0); err != nil {
+		return nil, err
+	}
+	if err := windows.CreatePipe(&outR, &outW, nil, 0); err != nil {
+		windows.CloseHandle(inR)
+		windows.CloseHandle(inW)
+		return nil, err
+	}
+
+	local := consoleSize()
+	var hpc windows.Handle
+	if err := windows.CreatePseudoConsole(
+		windows.Coord{X: int16(local.cols), Y: int16(local.rows)},
+		inR, outW, 0, &hpc,
+	); err != nil {
+		for _, h := range []windows.Handle{inR, inW, outR, outW} {
+			windows.CloseHandle(h)
+		}
+		return nil, err
+	}
+	// The console dup'd the read/write ends it needs; the host only keeps
+	// the opposite ends.
+	windows.CloseHandle(inR)
+	windows.CloseHandle(outW)
+
+	h := &Host{
+		hpc:      hpc,
+		inW:      os.NewFile(uintptr(inW), "conpty-in"),
+		outR:     os.NewFile(uintptr(outR), "conpty-out"),
+		sockPath: sockPath,
+		inputOK:  inputOK,
+		clients:  map[net.Conn]*clientState{},
+		local:    local,
+	}
+
+	// The attach socket is best-effort: if AF_UNIX is unavailable (older
+	// Windows, or a Wine layer), claude still runs on the ConPTY — it
+	// just isn't mirrored to cux attach / cuxdeck. The ConPTY itself is
+	// the essential part, so a socket error must not sink the session.
+	_ = os.Remove(sockPath)
+	if ln, err := net.Listen("unix", sockPath); err == nil {
+		_ = os.Chmod(sockPath, 0o600)
+		h.ln = ln
+		go h.acceptLoop()
+	}
+	return h, nil
+}
+
+func consoleSize() winsize {
+	// Best effort: query the real console; fall back to 80x24.
+	var info windows.ConsoleScreenBufferInfo
+	if err := windows.GetConsoleScreenBufferInfo(windows.Stdout, &info); err == nil {
+		cols := uint16(info.Window.Right - info.Window.Left + 1)
+		rows := uint16(info.Window.Bottom - info.Window.Top + 1)
+		if cols > 0 && rows > 0 {
+			return winsize{rows: rows, cols: cols}
+		}
+	}
+	return winsize{rows: 24, cols: 80}
+}
+
+// TTY / TTYDup are the Unix wiring points; on Windows the child attaches
+// via StartAttached instead, so these are unused.
+func (h *Host) TTY() *os.File             { return nil }
+func (h *Host) TTYDup() (*os.File, error) { return nil, ErrUnsupported }
+
+// SysProcAttr is unused on Windows (StartAttached builds its own
+// STARTUPINFOEX); returning nil keeps the shared signature satisfied.
+func SysProcAttr() *syscall.SysProcAttr { return nil }
+
+// Pump mirrors the console output to the real stdout and to attached
+// clients, and forwards local stdin into the console. Returns when the
+// console output closes.
+func (h *Host) Pump() {
+	go func() { _, _ = io.Copy(h.inW, os.Stdin) }()
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := h.outR.Read(buf)
+		if n > 0 {
+			_, _ = os.Stdout.Write(buf[:n])
+			h.broadcast(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (h *Host) BroadcastWriter() io.Writer { return broadcastWriter{h} }
+
+type broadcastWriter struct{ h *Host }
+
+func (b broadcastWriter) Write(p []byte) (int, error) { b.h.broadcast(p); return len(p), nil }
+
+func (h *Host) broadcast(p []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for c := range h.clients {
+		if err := writeFrame(c, FrameOut, p); err != nil {
+			_ = c.Close()
+			delete(h.clients, c)
+		}
+	}
+}
+
+func (h *Host) acceptLoop() {
+	for {
+		conn, err := h.ln.Accept()
+		if err != nil {
+			return
+		}
+		h.mu.Lock()
+		h.clients[conn] = &clientState{}
+		h.mu.Unlock()
+		go h.serve(conn)
+	}
+}
+
+func (h *Host) serve(conn net.Conn) {
+	defer func() {
+		h.mu.Lock()
+		delete(h.clients, conn)
+		h.mu.Unlock()
+		_ = conn.Close()
+		h.recomputeSize()
+	}()
+	for {
+		typ, payload, err := readFrame(conn)
+		if err != nil {
+			return
+		}
+		switch typ {
+		case FrameInput:
+			if h.inputOK {
+				_, _ = h.inW.Write(payload)
+			}
+		case FrameResize:
+			if len(payload) == 4 {
+				h.mu.Lock()
+				h.clients[conn].size = winsize{
+					rows: uint16(payload[0])<<8 | uint16(payload[1]),
+					cols: uint16(payload[2])<<8 | uint16(payload[3]),
+				}
+				h.mu.Unlock()
+				h.recomputeSize()
+			}
+		case FramePing:
+			_ = writeFrame(conn, FramePing, nil)
+		}
+	}
+}
+
+// recomputeSize applies the tmux rule: smallest declared participant
+// wins, so no viewer sees a clipped frame.
+func (h *Host) recomputeSize() {
+	h.mu.Lock()
+	eff := h.local
+	for _, c := range h.clients {
+		if c.size.rows == 0 || c.size.cols == 0 {
+			continue
+		}
+		if eff.rows == 0 || c.size.rows < eff.rows {
+			eff.rows = c.size.rows
+		}
+		if eff.cols == 0 || c.size.cols < eff.cols {
+			eff.cols = c.size.cols
+		}
+	}
+	h.mu.Unlock()
+	if eff.rows == 0 {
+		return
+	}
+	_ = windows.ResizePseudoConsole(h.hpc, windows.Coord{X: int16(eff.cols), Y: int16(eff.rows)})
+}
+
+// Close tears the socket and ConPTY down.
+func (h *Host) Close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.closed = true
+	for c := range h.clients {
+		_ = c.Close()
+	}
+	h.mu.Unlock()
+	if h.ln != nil {
+		_ = h.ln.Close()
+	}
+	_ = os.Remove(h.sockPath)
+	if h.hpc != 0 {
+		windows.ClosePseudoConsole(h.hpc)
+	}
+	if h.inW != nil {
+		_ = h.inW.Close()
+	}
+	if h.outR != nil {
+		_ = h.outR.Close()
+	}
+}
+
+// StartAttached launches claude attached to this ConPTY and returns a
+// child the wrapper can wait on / signal. Each launch gets a fresh
+// process on the same console, so attached viewers ride through account
+// swaps just like on Unix.
+func (h *Host) StartAttached(claudeBin string, argv, env []string) (*winChild, error) {
+	// Build the command line: "bin" arg1 arg2 … (quoted).
+	parts := make([]string, 0, len(argv)+1)
+	parts = append(parts, quoteArg(claudeBin))
+	for _, a := range argv {
+		parts = append(parts, quoteArg(a))
+	}
+	cmdline, err := windows.UTF16PtrFromString(strings.Join(parts, " "))
+	if err != nil {
+		return nil, err
+	}
+
+	// STARTUPINFOEX carrying the pseudo-console attribute.
+	attrList, err := windows.NewProcThreadAttributeList(1)
+	if err != nil {
+		return nil, err
+	}
+	defer attrList.Delete()
+	if err := attrList.Update(
+		procThreadAttributePseudoConsole,
+		unsafe.Pointer(h.hpc),
+		unsafe.Sizeof(h.hpc),
+	); err != nil {
+		return nil, err
+	}
+
+	var si windows.StartupInfoEx
+	si.StartupInfo.Cb = uint32(unsafe.Sizeof(si))
+	si.ProcThreadAttributeList = attrList.List()
+
+	var pi windows.ProcessInformation
+	flags := uint32(windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_UNICODE_ENVIRONMENT)
+	if err := windows.CreateProcess(
+		nil, cmdline, nil, nil, false, flags,
+		envBlock(env), nil, &si.StartupInfo, &pi,
+	); err != nil {
+		return nil, err
+	}
+	windows.CloseHandle(pi.Thread)
+	return &winChild{proc: pi.Process, pid: int(pi.ProcessId), host: h}, nil
+}
+
+// envBlock turns "K=V" strings into a UTF-16, double-null-terminated
+// environment block for CreateProcess.
+func envBlock(env []string) *uint16 {
+	var b []uint16
+	for _, e := range env {
+		u, err := windows.UTF16FromString(e)
+		if err != nil {
+			continue
+		}
+		b = append(b, u...) // u is already NUL-terminated
+	}
+	b = append(b, 0) // final NUL → double-NUL terminator
+	return &b[0]
+}
+
+// quoteArg applies minimal CommandLineToArgv-compatible quoting.
+func quoteArg(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\"") {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	slashes := 0
+	for _, r := range s {
+		switch r {
+		case '\\':
+			slashes++
+		case '"':
+			for i := 0; i < slashes*2+1; i++ {
+				b.WriteByte('\\')
+			}
+			slashes = 0
+			b.WriteByte('"')
+			continue
+		default:
+			slashes = 0
+		}
+		b.WriteRune(r)
+	}
+	for i := 0; i < slashes*2; i++ {
+		b.WriteByte('\\')
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// winChild is a ConPTY-attached claude process, satisfying wrapper.child.
+type winChild struct {
+	proc   windows.Handle
+	pid    int
+	host   *Host
+	exited atomic.Bool
+}
+
+func (c *winChild) Pid() int { return c.pid }
+
+// Signal maps os.Interrupt to a Ctrl-C byte written into the console —
+// ConPTY delivers it to the child as a real ^C. Other signals are no-ops
+// (Windows has no general kill-by-signal for another process group here).
+func (c *winChild) Signal(os.Signal) error {
+	_, err := c.host.inW.Write([]byte{0x03})
+	return err
+}
+
+func (c *winChild) Kill() error { return windows.TerminateProcess(c.proc, 1) }
+
+func (c *winChild) Exited() bool { return c.exited.Load() }
+
+func (c *winChild) Wait() error {
+	_, err := windows.WaitForSingleObject(c.proc, windows.INFINITE)
+	c.exited.Store(true)
+	if err != nil {
+		windows.CloseHandle(c.proc)
+		return err
+	}
+	var code uint32
+	_ = windows.GetExitCodeProcess(c.proc, &code)
+	windows.CloseHandle(c.proc)
+	if code != 0 {
+		return &exitError{code: int(code)}
+	}
+	return nil
+}
+
+// exitError mirrors *exec.ExitError enough for the wrapper's ExitCode
+// handling (errors.As on *exec.ExitError won't match, but the wrapper
+// only reads the code via its own path on Unix; on Windows a non-zero
+// exit returns this and the loop treats it as a normal exit code).
+type exitError struct{ code int }
+
+func (e *exitError) Error() string { return "exit status " + itoa(e.code) }
+func (e *exitError) ExitCode() int { return e.code }
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}
