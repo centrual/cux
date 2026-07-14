@@ -396,29 +396,15 @@ func setManualSwitchState(email string) {
 // whether at least one turn completed (Stop signal fired), and a non-nil
 // pending struct if the wrapper has decided to swap.
 func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config, manualTarget string, host *ptyhost.Host, w io.Writer) (int, string, bool, *pending, error) {
-	cmd := exec.Command(claudeBin, argv...)
-	if host != nil {
-		// A dup per launch: os/exec's Wait() closes the stdio files it's
-		// handed, so the shared PTY slave must not be wired in directly —
-		// otherwise the next relaunch (e.g. after a rate-limit account
-		// swap) fails with "bad file descriptor". exec owns and closes
-		// this dup; the real slave lives on with the Host.
-		tty, err := host.TTYDup()
-		if err != nil {
-			return 1, "", false, nil, fmt.Errorf("wrapper: dup pty slave: %w", err)
-		}
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
-		cmd.SysProcAttr = ptyhost.SysProcAttr()
-	} else {
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	cmd.Env = append(os.Environ(),
+	env := append(os.Environ(),
 		envWrapped+"=1",
 		envWrapperPID+"="+strconv.Itoa(wrapperPID),
 	)
-	if err := cmd.Start(); err != nil {
+	// startChild is platform-specific: Unix runs claude on a PTY slave
+	// (see start_other.go), Windows on a ConPTY (start_windows.go). The
+	// swap/poll/wait logic below drives it through the `child` interface.
+	ch, err := startChild(claudeBin, argv, env, host)
+	if err != nil {
 		return 1, "", false, nil, fmt.Errorf("wrapper: start claude: %w", err)
 	}
 
@@ -443,12 +429,12 @@ func launch(claudeBin string, argv []string, wrapperPID int, cfg *config.Config,
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				step(wrapperPID, cfg, manualTarget, &mu, &sessionID, &swap, &stopRequested, &hadTurns, cmd, w)
+				step(wrapperPID, cfg, manualTarget, &mu, &sessionID, &swap, &stopRequested, &hadTurns, ch, w)
 			}
 		}
 	}()
 
-	waitErr := cmd.Wait()
+	waitErr := ch.Wait()
 	cancel()
 	<-pollDone
 
@@ -492,7 +478,7 @@ func step(
 	swap **pending,
 	stopRequested *atomic.Bool,
 	hadTurns *atomic.Bool,
-	cmd *exec.Cmd,
+	ch child,
 	w io.Writer,
 ) {
 	// 1. Capture session-started if we haven't yet.
@@ -526,7 +512,7 @@ func step(
 			hasSwap = *swap != nil
 			mu.Unlock()
 			if hasSwap && stopRequested.CompareAndSwap(false, true) {
-				go gracefulExit(cmd, w)
+				go gracefulExit(ch, w)
 				return
 			}
 		} else {
@@ -553,7 +539,7 @@ func step(
 			hasSwap = *swap != nil
 			mu.Unlock()
 			if hasSwap && stopRequested.CompareAndSwap(false, true) {
-				go gracefulExit(cmd, w)
+				go gracefulExit(ch, w)
 				return
 			}
 		}
@@ -583,7 +569,7 @@ func step(
 		hasSwap = *swap != nil
 		mu.Unlock()
 		if hasSwap && stopRequested.CompareAndSwap(false, true) {
-			go gracefulExit(cmd, w)
+			go gracefulExit(ch, w)
 			return
 		}
 	}
@@ -616,7 +602,7 @@ func step(
 		hasSwap := *swap != nil
 		mu.Unlock()
 		if hasSwap && stopRequested.CompareAndSwap(false, true) {
-			go gracefulExit(cmd, w)
+			go gracefulExit(ch, w)
 			return
 		}
 	}
@@ -984,8 +970,9 @@ func shortDuration(d time.Duration) string {
 // transcript is usually flushed. Rate-limit and manual /switch paths
 // may interrupt mid-turn; Run waits for the transcript file to settle
 // before relaunching with --resume.
-func gracefulExit(cmd *exec.Cmd, w io.Writer) {
-	if cmd.Process == nil {
+func gracefulExit(ch child, w io.Writer) {
+	pid := ch.Pid()
+	if pid == 0 {
 		return
 	}
 	// Snapshot the descendant tree before signalling: claudeBin may be
@@ -994,8 +981,8 @@ func gracefulExit(cmd *exec.Cmd, w io.Writer) {
 	// dying shell does not forward it — grandchildren would survive,
 	// stay attached to the terminal, and fight the relaunched claude
 	// for stdin.
-	strays := descendantPIDs(cmd.Process.Pid)
-	_ = cmd.Process.Signal(os.Interrupt)
+	strays := descendantPIDs(pid)
+	_ = ch.Signal(os.Interrupt)
 
 	deadline := time.NewTimer(gracefulExitWait)
 	defer deadline.Stop()
@@ -1006,11 +993,11 @@ func gracefulExit(cmd *exec.Cmd, w io.Writer) {
 		select {
 		case <-deadline.C:
 			fmt.Fprintln(w, "cux: claude did not exit cleanly, terminating…")
-			_ = cmd.Process.Kill()
+			_ = ch.Kill()
 			reapStrays(strays, w)
 			return
 		case <-tick.C:
-			if cmd.ProcessState != nil {
+			if ch.Exited() {
 				reapStrays(strays, w)
 				return
 			}
