@@ -774,6 +774,9 @@ const (
 	// resetSlack pads each sleep so we wake after the API-side window
 	// has actually rolled over, not in the same second it should.
 	resetSlack = 90 * time.Second
+	// resetBuffer is extra margin on top of resetSlack so a resume lands
+	// a bit after the reset rather than exactly on it.
+	resetBuffer = time.Minute
 )
 
 func waitForReset(trigger history.Trigger, cfg *config.Config, w io.Writer) (string, error) {
@@ -787,15 +790,21 @@ func waitForReset(trigger history.Trigger, cfg *config.Config, w io.Writer) (str
 		if !ok {
 			return "", errors.New("all accounts exhausted and no reset time is known")
 		}
-		d := time.Until(readyAt) + resetSlack
-		if d < resetSlack {
-			d = resetSlack
+		// resetSlack pads past the reset; add another minute of margin so
+		// we resume a bit after the window rolls over rather than the
+		// instant it should, avoiding an immediate re-hit on clock skew or
+		// server-side rounding.
+		d := time.Until(readyAt) + resetSlack + resetBuffer
+		if d < resetSlack+resetBuffer {
+			d = resetSlack + resetBuffer
 		}
-		fmt.Fprintf(w, "cux: all accounts exhausted — waiting %s for %s to reset…\n",
-			shortDuration(d), email)
+		resumeAt := time.Now().Add(d)
+		resumeClock := resumeAt.Format("3:04 PM")
+		fmt.Fprintf(w, "cux: all accounts exhausted. %s reaches its reset first — resuming at %s (in %s).\n",
+			email, resumeClock, shortDuration(d))
 		registry.UpdateSelf(func(e *registry.Entry) {
 			e.State = registry.StateWaitingReset
-			e.Detail = fmt.Sprintf("%s resets in %s", email, shortDuration(d))
+			e.Detail = fmt.Sprintf("resuming at %s (%s left)", resumeClock, shortDuration(d))
 		})
 		// Sleep in slices instead of one block: a concurrent session may
 		// swap or refresh the shared cache while we wait, in which case
@@ -803,18 +812,24 @@ func waitForReset(trigger history.Trigger, cfg *config.Config, w io.Writer) (str
 		// probes only read local files — with no other session writing,
 		// they never fire and this degrades to the single plain sleep.
 		for d > 0 {
+			// Refresh an in-place line each slice so the wait shows the
+			// resume time and minutes remaining instead of looking frozen.
+			// Purely cosmetic — the probe/return logic below is unchanged,
+			// so a stalled overnight run still cannot happen.
+			fmt.Fprintf(w, "\r\033[Kcux: resuming at %s · %s remaining…", resumeClock, shortDuration(d))
 			chunk := min(d, waitPollInterval)
 			time.Sleep(chunk)
 			d -= chunk
 			if acct, ok := liveAccountWithCapacity(cfg); ok {
-				fmt.Fprintf(w, "cux: %s regained capacity while waiting — resuming early\n", acct.Email)
+				fmt.Fprintf(w, "\ncux: %s regained capacity while waiting — resuming early\n", acct.Email)
 				return acct.Email, nil
 			}
 			if target, err := resolveTarget("", trigger, cfg); err == nil {
-				fmt.Fprintf(w, "cux: capacity appeared on %s while waiting — resuming early\n", target)
+				fmt.Fprintf(w, "\ncux: capacity appeared on %s while waiting — resuming early\n", target)
 				return target, nil
 			}
 		}
+		fmt.Fprintln(w) // close the in-place countdown line before relaunch output
 		_, _ = monitor.RefreshAll()
 		if target, err := resolveTarget("", trigger, cfg); err == nil {
 			return target, nil
