@@ -120,10 +120,20 @@ func (h *Host) TTYDup() (*os.File, error) {
 	return os.OpenFile(h.tty.Name(), os.O_RDWR, 0)
 }
 
-// SysProcAttr returns the attributes a child needs to adopt the PTY as
-// its controlling terminal.
+// SysProcAttr returns the attributes for launching claude on the PTY.
+//
+// Setsid puts claude in its own session (isolated from cux's own
+// terminal). We deliberately do NOT set Setctty: making the slave the
+// child's controlling terminal means the child, as session leader,
+// revokes that terminal when it exits — which lands on the shared master
+// as EOF and kills Pump(), so the next relaunch (a rate-limit resume)
+// writes into a master nobody reads and hangs. Without Setctty the
+// master stays alive across launches. claude still sees a real tty on
+// its stdio (isatty true; size/raw handled via the master), and Ctrl-C /
+// input arrive as bytes written into the PTY, so no controlling terminal
+// is needed.
 func SysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	return &syscall.SysProcAttr{Setsid: true}
 }
 
 // Pump mirrors the user's terminal into and out of the PTY. It returns
