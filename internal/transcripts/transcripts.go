@@ -151,3 +151,87 @@ func scanSession(path string, since time.Time, st *Stats) {
 		st.LastAt = last
 	}
 }
+
+// FirstPrompt returns a short human-readable label for a session: its
+// first real user message, collapsed to one line and truncated to max
+// runes. This is the text Claude Code's own session summaries are
+// derived from, so it reads like a title ("review the pull request …").
+// Returns "" when the transcript is missing or has no usable message —
+// callers fall back to the directory name.
+//
+// Command wrappers, tool results, and hook/system reminders that Claude
+// Code records as user-role lines are skipped: they start with '<' or
+// are structured content rather than something the human typed.
+func FirstPrompt(projectDir, sessionID string, max int) string {
+	if sessionID == "" {
+		return ""
+	}
+	path := filepath.Join(paths.ProjectTranscriptDir(projectDir), sessionID+".jsonl")
+	fh, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer fh.Close()
+
+	r := bufio.NewReaderSize(fh, 256*1024)
+	for {
+		raw, err := r.ReadBytes('\n')
+		if len(raw) > 0 {
+			var line struct {
+				Type    string `json:"type"`
+				Message struct {
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(raw, &line) == nil && line.Type == "user" {
+				if s := collapseLine(promptText(line.Message.Content)); s != "" && !strings.HasPrefix(s, "<") {
+					return truncateRunes(s, max)
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return ""
+}
+
+// promptText pulls the human text out of a message's content, which is
+// either a bare string or an array of typed parts (we want the first
+// "text" part).
+func promptText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(content, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &parts) == nil {
+		for _, p := range parts {
+			if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+				return p.Text
+			}
+		}
+	}
+	return ""
+}
+
+func collapseLine(s string) string {
+	return strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return strings.TrimRight(string(r[:max]), " ") + "…"
+}

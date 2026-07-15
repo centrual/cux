@@ -606,7 +606,12 @@ func cmdSessions(args []string) {
 		if sid == "" {
 			sid = "-"
 		}
-		fmt.Printf("[%d] %s\n", e.PID, e.CWD)
+		name := transcripts.FirstPrompt(e.CWD, e.SessionID, 60)
+		if name == "" {
+			name = filepath.Base(e.CWD)
+		}
+		fmt.Printf("[%d] %s\n", e.PID, name)
+		fmt.Printf("    %s\n", e.CWD)
 		fmt.Printf("    seat %-28s session %-9s %s\n", e.Seat, sid, state)
 		fmt.Printf("    up %s, last change %s ago\n",
 			formatDuration(now.Sub(e.StartedAt)), formatDuration(now.Sub(e.UpdatedAt)))

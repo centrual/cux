@@ -3,15 +3,21 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/inulute/cux/internal/paths"
 	"github.com/inulute/cux/internal/ptyhost"
 	"github.com/inulute/cux/internal/registry"
+	"github.com/inulute/cux/internal/transcripts"
 	"golang.org/x/term"
 )
 
@@ -58,8 +64,9 @@ func cmdAttach(args []string) int {
 		}
 	}()
 
-	done := make(chan struct{})
-	go func() { // socket → terminal
+	done := make(chan struct{})   // host closed the connection (session ended / dropped)
+	detach := make(chan struct{}) // user pressed the detach key
+	go func() {                   // socket → terminal
 		defer close(done)
 		for {
 			typ, payload, err := ptyhost.ReadFrame(conn)
@@ -81,7 +88,7 @@ func cmdAttach(args []string) int {
 			}
 			for i := 0; i < n; i++ {
 				if buf[i] == detachKey {
-					_ = conn.Close()
+					close(detach)
 					return
 				}
 			}
@@ -91,9 +98,38 @@ func cmdAttach(args []string) int {
 		}
 	}()
 
-	<-done
-	fmt.Print("\r\ncux: detached\r\n")
+	// Exit on whichever fires first. Detach must signal directly rather
+	// than wait for the output goroutine to notice conn.Close(): under
+	// heavy output that goroutine is busy writing to the terminal, so a
+	// detach keypress would otherwise sit undetected until the stream
+	// paused.
+	select {
+	case <-detach:
+		finishAttach(fd, old, conn, "detached")
+	case <-done:
+		finishAttach(fd, old, conn, "session ended")
+	}
 	return 0
+}
+
+// finishAttach restores the terminal and exits. The confirmation write
+// is best-effort with a short timeout: under heavy output the terminal
+// is backed up, so a blocking write to stdout would wedge the detach —
+// the exact hang this guards against. Restoring the tty is a
+// non-blocking ioctl; the returning shell prompt is the real signal.
+func finishAttach(fd int, old *term.State, conn net.Conn, why string) {
+	_ = term.Restore(fd, old)
+	_ = conn.Close()
+	printed := make(chan struct{})
+	go func() {
+		fmt.Printf("\r\ncux: %s\r\n", why)
+		close(printed)
+	}()
+	select {
+	case <-printed:
+	case <-time.After(150 * time.Millisecond):
+	}
+	os.Exit(0)
 }
 
 // pickSession resolves the target wrapper PID: an explicit argument
@@ -118,6 +154,39 @@ func pickSession(args []string) (int, error) {
 	case 1:
 		return attachable[0].PID, nil
 	default:
-		return 0, fmt.Errorf("%d attachable sessions — pick one: `cux attach <pid>` (see `cux sessions`)", len(attachable))
+		return promptSession(attachable)
 	}
+}
+
+// promptSession lists the attachable sessions and reads a choice from
+// stdin. Used when `cux attach` is run with no pid and more than one
+// session is attachable, so the user can pick from names/pids directly
+// instead of first running `cux sessions` to copy a pid.
+func promptSession(sessions []registry.Entry) (int, error) {
+	fmt.Fprintln(os.Stderr, "cux: multiple attachable sessions — select one:")
+	for i, e := range sessions {
+		state := e.State
+		if e.Detail != "" {
+			state += " (" + e.Detail + ")"
+		}
+		name := transcripts.FirstPrompt(e.CWD, e.SessionID, 60)
+		if name == "" {
+			name = filepath.Base(e.CWD)
+		}
+		fmt.Fprintf(os.Stderr, "  %d) %s\n        [%d] %s  seat %s  %s\n", i+1, name, e.PID, e.CWD, e.Seat, state)
+	}
+	fmt.Fprintf(os.Stderr, "Select 1-%d (q to cancel): ", len(sessions))
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return 0, fmt.Errorf("attach: no selection made")
+	}
+	line = strings.TrimSpace(line)
+	if line == "" || strings.EqualFold(line, "q") {
+		return 0, fmt.Errorf("attach: cancelled")
+	}
+	n, err := strconv.Atoi(line)
+	if err != nil || n < 1 || n > len(sessions) {
+		return 0, fmt.Errorf("attach: %q is not a choice between 1 and %d", line, len(sessions))
+	}
+	return sessions[n-1].PID, nil
 }
