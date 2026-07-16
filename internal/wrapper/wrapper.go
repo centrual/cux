@@ -123,6 +123,9 @@ func Run(claudeBin string, argv []string, w io.Writer) (int, error) {
 	var host *ptyhost.Host
 	if cfg.Attach && term.IsTerminal(int(os.Stdin.Fd())) {
 		_ = os.MkdirAll(paths.AttachDir(), 0o700)
+		// Crashed wrappers leave their sockets behind; sweep the dead
+		// ones so attach surfaces never probe endpoints that can't answer.
+		registry.ReapStaleAttachSockets()
 		if h, err := ptyhost.New(paths.AttachSock(pid), cfg.AttachInput); err == nil {
 			host = h
 			defer host.Close()
