@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/inulute/cux/internal/config"
 	"github.com/inulute/cux/internal/paths"
 	"github.com/inulute/cux/internal/ptyhost"
 	"github.com/inulute/cux/internal/registry"
@@ -28,6 +29,13 @@ const detachKey = 0x1c // Ctrl+\
 // the only attachable session; with one it takes the wrapper PID shown
 // by `cux sessions`.
 func cmdAttach(args []string) int {
+	// Attach is opt-in: it runs claude on a wrapper-owned PTY, which adds
+	// terminal overhead to every session, so it's off by default. If it's
+	// disabled, offer to turn it on rather than failing with an opaque
+	// "no attachable sessions".
+	if cfg, _ := config.Load(); !cfg.Attach {
+		return enableAttachPrompt()
+	}
 	pid, err := pickSession(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cux:", err)
@@ -134,6 +142,42 @@ func finishAttach(fd int, old *term.State, conn net.Conn, why string) {
 
 // pickSession resolves the target wrapper PID: an explicit argument
 // wins; otherwise the registry must hold exactly one attachable entry.
+// enableAttachPrompt runs when `cux attach` is used while attach is
+// disabled. It explains the trade-off and offers to turn it on. Enabling
+// only affects sessions started afterwards — a session already running
+// can't be moved onto a PTY, so it must be restarted to become
+// attachable.
+func enableAttachPrompt() int {
+	fmt.Fprint(os.Stderr,
+		"cux: attach is disabled.\n"+
+			"     It runs Claude on a wrapper-owned PTY so other terminals (and cuxdeck)\n"+
+			"     can mirror the session — but that adds a little rendering overhead to\n"+
+			"     every session, so it's off by default.\n"+
+			"Enable it now? [y/N]: ")
+	line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if ans := strings.ToLower(strings.TrimSpace(line)); ans != "y" && ans != "yes" {
+		fmt.Fprintln(os.Stderr, "cux: left disabled. Enable any time with `cux config set attach true`.")
+		return 0
+	}
+	c, err := config.Load()
+	if err == nil {
+		c, err = config.Set(c, "attach", "true")
+	}
+	if err == nil {
+		err = config.Save(c)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cux: could not enable attach: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(os.Stderr,
+		"cux: attach enabled. Sessions started from now on are attachable.\n"+
+			"     A session that's already running must be restarted (a fresh `cux`) to\n"+
+			"     become attachable — a running Claude can't be moved onto a PTY. Then run\n"+
+			"     `cux attach` again.")
+	return 0
+}
+
 func pickSession(args []string) (int, error) {
 	if len(args) > 0 {
 		var pid int

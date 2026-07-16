@@ -100,8 +100,13 @@ func Defaults() Config {
 		PollIntervalSeconds:   60,
 		UpdateCheck:           UpdateCheckConfig{Enabled: true, CadenceHours: 6},
 		Theme:                 "claude",
-		Attach:                true,
-		AttachInput:           true,
+		// Off by default: an always-on PTY proxy taxes every session
+		// (resize corruption/jitter, extra CPU on output — see #33). Most
+		// users never attach, so keep claude sitting directly on the real
+		// terminal (native 0.2.x rendering). Opt in with
+		// `cux config set attach true` to enable `cux attach` / cuxdeck.
+		Attach:      false,
+		AttachInput: true,
 	}
 }
 
@@ -233,6 +238,18 @@ func Set(c Config, key, value string) (Config, error) {
 			return c, err
 		}
 		c.Notify = b
+	case "attach":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
+		}
+		c.Attach = b
+	case "attach_input":
+		b, err := parseBool(value)
+		if err != nil {
+			return c, err
+		}
+		c.AttachInput = b
 	case "update_check.enabled":
 		b, err := parseBool(value)
 		if err != nil {
@@ -355,6 +372,16 @@ func Keys(c Config) []KeyInfo {
 			Key: "theme", Default: "default",
 			Description: "visual style: default | claude",
 			Current:     c.Theme,
+		},
+		{
+			Key: "attach", Default: "false",
+			Description: "run claude on a wrapper PTY so `cux attach`/cuxdeck can mirror it (off = native rendering, no per-session overhead)",
+			Current:     strconv.FormatBool(c.Attach),
+		},
+		{
+			Key: "attach_input", Default: "true",
+			Description: "when attach is on, let attached clients type into the session (false = view-only)",
+			Current:     strconv.FormatBool(c.AttachInput),
 		},
 	}
 }
