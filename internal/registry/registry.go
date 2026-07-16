@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"syscall"
+	"strings"
 	"time"
 
 	"github.com/inulute/cux/internal/atomicfile"
@@ -109,17 +109,30 @@ func List() []Entry {
 	return out
 }
 
-// processAlive probes pid with the null signal. On platforms where the
-// probe is unsupported it reports true, so entries are kept rather
-// than wrongly reaped.
-func processAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
+// ReapStaleAttachSockets removes attach sockets left behind by wrappers
+// that crashed or were killed: the listener died with its process, so a
+// socket whose PID (its filename) is gone can never accept again — but
+// while the file exists, attach surfaces (`cux attach`, cuxdeck bridges)
+// keep probing a dead endpoint. Called at wrapper startup so the attach
+// directory is self-healing, the same way List is for session entries.
+// A wrapper's live socket is untouched: its PID probe says alive.
+func ReapStaleAttachSockets() {
+	entries, err := os.ReadDir(paths.AttachDir())
 	if err != nil {
-		return false
+		return
 	}
-	err = p.Signal(syscall.Signal(0))
-	if err == nil {
-		return true
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || filepath.Ext(name) != ".sock" {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSuffix(name, ".sock"))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		if pid == os.Getpid() || processAlive(pid) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(paths.AttachDir(), name))
 	}
-	return err == syscall.EPERM
 }
